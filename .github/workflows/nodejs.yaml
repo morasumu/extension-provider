@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-node@v2-beta
         with:
           node-version: 12.x
-      - uses: NiceLabs/automatic-github-token@v2
+      - uses: dimensiondev/github-token-action@latest
         with:
           registry: true
       - run: npm ci
