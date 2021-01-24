@@ -1,30 +1,31 @@
 const createProvider = require('../')
-const Eth = require('ethjs')
-
+const Web3 = require('web3')
 const provider = createProvider()
 
 renderText('Loading...')
 
 if (provider) {
-  console.log('provider detected', provider)
-  const eth = new Eth(provider)
+  const web3 = new Web3(provider)
+
   renderText('MetaMask provider detected.')
-  eth.accounts()
-  .then((accounts) => {
-    renderText(`Detected MetaMask account ${accounts[0]}`)
-  })
+
+  web3.eth.requestAccounts()
+    .then((accounts) => {
+      renderText(`Detected MetaMask account ${accounts[0]}`)
+    })
+    .catch((e) => {
+      renderText(`Failed: ${e.message}`)
+    })
 
   provider.on('error', (error) => {
     if (error && error.includes('lost connection')) {
-      renderText('MetaMask extension not detected.')
+      renderText('Lost connection.')
     }
   })
-
 } else {
   renderText('MetaMask provider not detected.')
 }
 
-function renderText (text) {
+function renderText(text) {
   content.innerText = text
 }
-

@@ -26,6 +26,6 @@
     "extension-port-stream": "^1.0.0"
   },
   "devDependencies": {
-    "ethjs": "^0.4.0"
+    "web3": "^1.3.3"
   }
 }
