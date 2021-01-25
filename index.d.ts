@@ -1,2 +1,2 @@
-import { MetaMaskInpageProvider } from '@metamask/inpage-provider';
-export default function createMetaMaskProvider(): MetaMaskInpageProvider;
+import { MetaMaskInpageProvider } from 'inpage-provider-8';
+export default function createMetaMaskProvider(): Promise<MetaMaskInpageProvider>;

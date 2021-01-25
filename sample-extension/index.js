@@ -1,10 +1,9 @@
 const createProvider = require('../')
 const Web3 = require('web3')
-const provider = createProvider()
 
 renderText('Loading...')
 
-if (provider) {
+createProvider().then(provider => {
   const web3 = new Web3(provider)
 
   renderText('MetaMask provider detected.')
@@ -22,9 +21,9 @@ if (provider) {
       renderText('Lost connection.')
     }
   })
-} else {
+}).catch(e => {
   renderText('MetaMask provider not detected.')
-}
+})
 
 function renderText(text) {
   content.innerText = text
