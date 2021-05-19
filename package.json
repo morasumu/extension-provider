@@ -1,6 +1,6 @@
 {
   "name": "@dimensiondev/metamask-extension-provider",
-  "version": "3.0.4",
+  "version": "3.0.5",
   "description": "A module for allowing a WebExtension to access the web3 provider from an installed MetaMask instance.",
   "main": "index.js",
   "type": "index.d.ts",
