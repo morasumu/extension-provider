@@ -32090,23 +32090,11 @@ module.exports={
 }
 
 },{}],243:[function(require,module,exports){
-const { MetaMaskInpageProvider: MetaMaskInpageProviderV7 } = require('inpage-provider-7')
-const { MetaMaskInpageProvider: MetaMaskInpageProviderV8 } = require('inpage-provider-8')
+const { MetaMaskInpageProvider } = require('@metamask/inpage-provider')
 const PortStream = require('extension-port-stream')
 const { detect } = require('detect-browser')
 const browser = detect()
 const config = require('./config.json')
-
-function checkAvailability(provider) {
-  return new Promise((resolve) => {
-    try {
-      provider.request({ method: 'net_version' }).then(() => resolve(true)).catch(() => resolve(false))
-      setTimeout(() => resolve(false), 1000)
-    } catch (e) {
-      resolve(false)
-    }
-  })
-}
 
 function getMetaMaskId () {
   switch (browser && browser.name) {
@@ -32120,22 +32108,14 @@ function getMetaMaskId () {
 }
 
 async function createMetaMaskProvider() {
-  let provider
-  try {
-    let currentMetaMaskId = getMetaMaskId()
-    const metamaskPort = chrome.runtime.connect(currentMetaMaskId)
-    const pluginStream = new PortStream(metamaskPort)
-    provider = new MetaMaskInpageProviderV8(pluginStream)
-    if (!(await checkAvailability(provider))) provider = new MetaMaskInpageProviderV7(pluginStream)
-    if (!(await checkAvailability(provider))) throw new Error('Failed to create provider.')
- } catch (error) {
-    throw error
-  }
-  return provider
+  const currentMetaMaskId = getMetaMaskId()
+  const metamaskPort = chrome.runtime.connect(currentMetaMaskId)
+  const pluginStream = new PortStream(metamaskPort)
+  return new MetaMaskInpageProvider(pluginStream)
 }
 
 module.exports = createMetaMaskProvider
-},{"./config.json":242,"detect-browser":393,"extension-port-stream":469,"inpage-provider-7":507,"inpage-provider-8":530}],244:[function(require,module,exports){
+},{"./config.json":242,"@metamask/inpage-provider":300,"detect-browser":405,"extension-port-stream":480}],244:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.version = "abi/5.0.7";
@@ -34832,7 +34812,7 @@ function _base16To36(value) {
 }
 exports._base16To36 = _base16To36;
 
-},{"./_version":262,"@ethersproject/bytes":267,"@ethersproject/logger":281,"bn.js":315}],264:[function(require,module,exports){
+},{"./_version":262,"@ethersproject/bytes":267,"@ethersproject/logger":281,"bn.js":327}],264:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 var bytes_1 = require("@ethersproject/bytes");
@@ -36258,7 +36238,7 @@ function keccak256(data) {
 }
 exports.keccak256 = keccak256;
 
-},{"@ethersproject/bytes":267,"js-sha3":540}],280:[function(require,module,exports){
+},{"@ethersproject/bytes":267,"js-sha3":522}],280:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.version = "logger/5.0.8";
@@ -36887,7 +36867,7 @@ var elliptic_1 = __importDefault(require("elliptic"));
 var EC = elliptic_1.default.ec;
 exports.EC = EC;
 
-},{"elliptic":398}],288:[function(require,module,exports){
+},{"elliptic":410}],288:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 var elliptic_1 = require("./elliptic");
@@ -37674,6 +37654,1272 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+const pump_1 = __importDefault(require("pump"));
+const json_rpc_engine_1 = require("json-rpc-engine");
+const json_rpc_middleware_stream_1 = require("json-rpc-middleware-stream");
+const object_multiplex_1 = __importDefault(require("@metamask/object-multiplex"));
+const safe_event_emitter_1 = __importDefault(require("@metamask/safe-event-emitter"));
+const fast_deep_equal_1 = __importDefault(require("fast-deep-equal"));
+const eth_rpc_errors_1 = require("eth-rpc-errors");
+const is_stream_1 = require("is-stream");
+const messages_1 = __importDefault(require("./messages"));
+const utils_1 = require("./utils");
+class BaseProvider extends safe_event_emitter_1.default {
+    /**
+     * @param connectionStream - A Node.js duplex stream
+     * @param options - An options bag
+     * @param options.jsonRpcStreamName - The name of the internal JSON-RPC stream.
+     * Default: metamask-provider
+     * @param options.logger - The logging API to use. Default: console
+     * @param options.maxEventListeners - The maximum number of event
+     * listeners. Default: 100
+     */
+    constructor(connectionStream, { jsonRpcStreamName = 'metamask-provider', logger = console, maxEventListeners = 100, } = {}) {
+        super();
+        if (!is_stream_1.duplex(connectionStream)) {
+            throw new Error(messages_1.default.errors.invalidDuplexStream());
+        }
+        this._log = logger;
+        this.setMaxListeners(maxEventListeners);
+        // private state
+        this._state = Object.assign({}, BaseProvider._defaultState);
+        // public state
+        this.selectedAddress = null;
+        this.chainId = null;
+        // bind functions (to prevent consumers from making unbound calls)
+        this._handleAccountsChanged = this._handleAccountsChanged.bind(this);
+        this._handleConnect = this._handleConnect.bind(this);
+        this._handleChainChanged = this._handleChainChanged.bind(this);
+        this._handleDisconnect = this._handleDisconnect.bind(this);
+        this._handleStreamDisconnect = this._handleStreamDisconnect.bind(this);
+        this._handleUnlockStateChanged = this._handleUnlockStateChanged.bind(this);
+        this._rpcRequest = this._rpcRequest.bind(this);
+        this.request = this.request.bind(this);
+        // setup connectionStream multiplexing
+        const mux = new object_multiplex_1.default();
+        pump_1.default(connectionStream, mux, connectionStream, this._handleStreamDisconnect.bind(this, 'MetaMask'));
+        // setup own event listeners
+        // EIP-1193 connect
+        this.on('connect', () => {
+            this._state.isConnected = true;
+        });
+        // setup RPC connection
+        this._jsonRpcConnection = json_rpc_middleware_stream_1.createStreamMiddleware();
+        pump_1.default(this._jsonRpcConnection.stream, mux.createStream(jsonRpcStreamName), this._jsonRpcConnection.stream, this._handleStreamDisconnect.bind(this, 'MetaMask RpcProvider'));
+        // handle RPC requests via dapp-side rpc engine
+        const rpcEngine = new json_rpc_engine_1.JsonRpcEngine();
+        rpcEngine.push(json_rpc_engine_1.createIdRemapMiddleware());
+        rpcEngine.push(utils_1.createErrorMiddleware(this._log));
+        rpcEngine.push(this._jsonRpcConnection.middleware);
+        this._rpcEngine = rpcEngine;
+        this._initializeState();
+        // handle JSON-RPC notifications
+        this._jsonRpcConnection.events.on('notification', (payload) => {
+            const { method, params } = payload;
+            if (method === 'metamask_accountsChanged') {
+                this._handleAccountsChanged(params);
+            }
+            else if (method === 'metamask_unlockStateChanged') {
+                this._handleUnlockStateChanged(params);
+            }
+            else if (method === 'metamask_chainChanged') {
+                this._handleChainChanged(params);
+            }
+            else if (utils_1.EMITTED_NOTIFICATIONS.includes(method)) {
+                this.emit('message', {
+                    type: method,
+                    data: params,
+                });
+            }
+            else if (method === 'METAMASK_STREAM_FAILURE') {
+                connectionStream.destroy(new Error(messages_1.default.errors.permanentlyDisconnected()));
+            }
+        });
+    }
+    //====================
+    // Public Methods
+    //====================
+    /**
+     * Returns whether the provider can process RPC requests.
+     */
+    isConnected() {
+        return this._state.isConnected;
+    }
+    /**
+     * Submits an RPC request for the given method, with the given params.
+     * Resolves with the result of the method call, or rejects on error.
+     *
+     * @param args - The RPC request arguments.
+     * @param args.method - The RPC method name.
+     * @param args.params - The parameters for the RPC method.
+     * @returns A Promise that resolves with the result of the RPC method,
+     * or rejects if an error is encountered.
+     */
+    async request(args) {
+        if (!args || typeof args !== 'object' || Array.isArray(args)) {
+            throw eth_rpc_errors_1.ethErrors.rpc.invalidRequest({
+                message: messages_1.default.errors.invalidRequestArgs(),
+                data: args,
+            });
+        }
+        const { method, params } = args;
+        if (typeof method !== 'string' || method.length === 0) {
+            throw eth_rpc_errors_1.ethErrors.rpc.invalidRequest({
+                message: messages_1.default.errors.invalidRequestMethod(),
+                data: args,
+            });
+        }
+        if (params !== undefined &&
+            !Array.isArray(params) &&
+            (typeof params !== 'object' || params === null)) {
+            throw eth_rpc_errors_1.ethErrors.rpc.invalidRequest({
+                message: messages_1.default.errors.invalidRequestParams(),
+                data: args,
+            });
+        }
+        return new Promise((resolve, reject) => {
+            this._rpcRequest({ method, params }, utils_1.getRpcPromiseCallback(resolve, reject));
+        });
+    }
+    //====================
+    // Private Methods
+    //====================
+    /**
+     * Constructor helper.
+     * Populates initial state by calling 'metamask_getProviderState' and emits
+     * necessary events.
+     */
+    async _initializeState() {
+        try {
+            const { accounts, chainId, isUnlocked, networkVersion, } = (await this.request({
+                method: 'metamask_getProviderState',
+            }));
+            // indicate that we've connected, for EIP-1193 compliance
+            this.emit('connect', { chainId });
+            this._handleChainChanged({ chainId, networkVersion });
+            this._handleUnlockStateChanged({ accounts, isUnlocked });
+            this._handleAccountsChanged(accounts);
+        }
+        catch (error) {
+            this._log.error('MetaMask: Failed to get initial state. Please report this bug.', error);
+        }
+        finally {
+            this._state.initialized = true;
+            this.emit('_initialized');
+        }
+    }
+    /**
+     * Internal RPC method. Forwards requests to background via the RPC engine.
+     * Also remap ids inbound and outbound.
+     *
+     * @param payload - The RPC request object.
+     * @param callback - The consumer's callback.
+     */
+    _rpcRequest(payload, callback) {
+        let cb = callback;
+        if (!Array.isArray(payload)) {
+            if (!payload.jsonrpc) {
+                payload.jsonrpc = '2.0';
+            }
+            if (payload.method === 'eth_accounts' ||
+                payload.method === 'eth_requestAccounts') {
+                // handle accounts changing
+                cb = (err, res) => {
+                    this._handleAccountsChanged(res.result || [], payload.method === 'eth_accounts');
+                    callback(err, res);
+                };
+            }
+            return this._rpcEngine.handle(payload, cb);
+        }
+        return this._rpcEngine.handle(payload, cb);
+    }
+    /**
+     * When the provider becomes connected, updates internal state and emits
+     * required events. Idempotent.
+     *
+     * @param chainId - The ID of the newly connected chain.
+     * @emits MetaMaskInpageProvider#connect
+     */
+    _handleConnect(chainId) {
+        if (!this._state.isConnected) {
+            this._state.isConnected = true;
+            this.emit('connect', { chainId });
+            this._log.debug(messages_1.default.info.connected(chainId));
+        }
+    }
+    /**
+     * When the provider becomes disconnected, updates internal state and emits
+     * required events. Idempotent with respect to the isRecoverable parameter.
+     *
+     * Error codes per the CloseEvent status codes as required by EIP-1193:
+     * https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent#Status_codes
+     *
+     * @param isRecoverable - Whether the disconnection is recoverable.
+     * @param errorMessage - A custom error message.
+     * @emits MetaMaskInpageProvider#disconnect
+     */
+    _handleDisconnect(isRecoverable, errorMessage) {
+        if (this._state.isConnected ||
+            (!this._state.isPermanentlyDisconnected && !isRecoverable)) {
+            this._state.isConnected = false;
+            let error;
+            if (isRecoverable) {
+                error = new eth_rpc_errors_1.EthereumRpcError(1013, // Try again later
+                errorMessage || messages_1.default.errors.disconnected());
+                this._log.debug(error);
+            }
+            else {
+                error = new eth_rpc_errors_1.EthereumRpcError(1011, // Internal error
+                errorMessage || messages_1.default.errors.permanentlyDisconnected());
+                this._log.error(error);
+                this.chainId = null;
+                this._state.accounts = null;
+                this.selectedAddress = null;
+                this._state.isUnlocked = false;
+                this._state.isPermanentlyDisconnected = true;
+            }
+            this.emit('disconnect', error);
+        }
+    }
+    /**
+     * Called when connection is lost to critical streams.
+     *
+     * @emits MetamaskInpageProvider#disconnect
+     */
+    _handleStreamDisconnect(streamName, error) {
+        utils_1.logStreamDisconnectWarning(this._log, streamName, error, this);
+        this._handleDisconnect(false, error ? error.message : undefined);
+    }
+    /**
+     * Upon receipt of a new chainId and networkVersion, emits corresponding
+     * events and sets relevant public state.
+     * Does nothing if neither the chainId nor the networkVersion are different
+     * from existing values.
+     *
+     * @emits MetamaskInpageProvider#chainChanged
+     * @param networkInfo - An object with network info.
+     * @param networkInfo.chainId - The latest chain ID.
+     * @param networkInfo.networkVersion - The latest network ID.
+     */
+    _handleChainChanged({ chainId, networkVersion, } = {}) {
+        if (!chainId ||
+            typeof chainId !== 'string' ||
+            !chainId.startsWith('0x') ||
+            !networkVersion ||
+            typeof networkVersion !== 'string') {
+            this._log.error('MetaMask: Received invalid network parameters. Please report this bug.', { chainId, networkVersion });
+            return;
+        }
+        if (networkVersion === 'loading') {
+            this._handleDisconnect(true);
+        }
+        else {
+            this._handleConnect(chainId);
+            if (chainId !== this.chainId) {
+                this.chainId = chainId;
+                if (this._state.initialized) {
+                    this.emit('chainChanged', this.chainId);
+                }
+            }
+        }
+    }
+    /**
+     * Called when accounts may have changed. Diffs the new accounts value with
+     * the current one, updates all state as necessary, and emits the
+     * accountsChanged event.
+     *
+     * @param accounts - The new accounts value.
+     * @param isEthAccounts - Whether the accounts value was returned by
+     * a call to eth_accounts.
+     */
+    _handleAccountsChanged(accounts, isEthAccounts = false) {
+        let _accounts = accounts;
+        if (!Array.isArray(accounts)) {
+            this._log.error('MetaMask: Received invalid accounts parameter. Please report this bug.', accounts);
+            _accounts = [];
+        }
+        for (const account of accounts) {
+            if (typeof account !== 'string') {
+                this._log.error('MetaMask: Received non-string account. Please report this bug.', accounts);
+                _accounts = [];
+                break;
+            }
+        }
+        // emit accountsChanged if anything about the accounts array has changed
+        if (!fast_deep_equal_1.default(this._state.accounts, _accounts)) {
+            // we should always have the correct accounts even before eth_accounts
+            // returns
+            if (isEthAccounts && this._state.accounts !== null) {
+                this._log.error(`MetaMask: 'eth_accounts' unexpectedly updated accounts. Please report this bug.`, _accounts);
+            }
+            this._state.accounts = _accounts;
+            // handle selectedAddress
+            if (this.selectedAddress !== _accounts[0]) {
+                this.selectedAddress = _accounts[0] || null;
+            }
+            // finally, after all state has been updated, emit the event
+            if (this._state.initialized) {
+                this.emit('accountsChanged', _accounts);
+            }
+        }
+    }
+    /**
+     * Upon receipt of a new isUnlocked state, sets relevant public state.
+     * Calls the accounts changed handler with the received accounts, or an empty
+     * array.
+     *
+     * Does nothing if the received value is equal to the existing value.
+     * There are no lock/unlock events.
+     *
+     * @param opts - Options bag.
+     * @param opts.accounts - The exposed accounts, if any.
+     * @param opts.isUnlocked - The latest isUnlocked value.
+     */
+    _handleUnlockStateChanged({ accounts, isUnlocked, } = {}) {
+        if (typeof isUnlocked !== 'boolean') {
+            this._log.error('MetaMask: Received invalid isUnlocked parameter. Please report this bug.');
+            return;
+        }
+        if (isUnlocked !== this._state.isUnlocked) {
+            this._state.isUnlocked = isUnlocked;
+            this._handleAccountsChanged(accounts || []);
+        }
+    }
+}
+exports.default = BaseProvider;
+BaseProvider._defaultState = {
+    accounts: null,
+    isConnected: false,
+    isUnlocked: false,
+    initialized: false,
+    isPermanentlyDisconnected: false,
+};
+
+},{"./messages":302,"./utils":305,"@metamask/object-multiplex":310,"@metamask/safe-event-emitter":311,"eth-rpc-errors":435,"fast-deep-equal":481,"is-stream":520,"json-rpc-engine":528,"json-rpc-middleware-stream":532,"pump":588}],297:[function(require,module,exports){
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const eth_rpc_errors_1 = require("eth-rpc-errors");
+const siteMetadata_1 = __importDefault(require("./siteMetadata"));
+const messages_1 = __importDefault(require("./messages"));
+const utils_1 = require("./utils");
+const BaseProvider_1 = __importDefault(require("./BaseProvider"));
+class MetaMaskInpageProvider extends BaseProvider_1.default {
+    /**
+     * @param connectionStream - A Node.js duplex stream
+     * @param options - An options bag
+     * @param options.jsonRpcStreamName - The name of the internal JSON-RPC stream.
+     * Default: metamask-provider
+     * @param options.logger - The logging API to use. Default: console
+     * @param options.maxEventListeners - The maximum number of event
+     * listeners. Default: 100
+     * @param options.shouldSendMetadata - Whether the provider should
+     * send page metadata. Default: true
+     */
+    constructor(connectionStream, { jsonRpcStreamName = 'metamask-provider', logger = console, maxEventListeners = 100, shouldSendMetadata = true, } = {}) {
+        super(connectionStream, { jsonRpcStreamName, logger, maxEventListeners });
+        this._sentWarnings = {
+            // methods
+            enable: false,
+            experimentalMethods: false,
+            send: false,
+            // events
+            events: {
+                close: false,
+                data: false,
+                networkChanged: false,
+                notification: false,
+            },
+        };
+        this.networkVersion = null;
+        this.isMetaMask = true;
+        this._sendSync = this._sendSync.bind(this);
+        this.enable = this.enable.bind(this);
+        this.send = this.send.bind(this);
+        this.sendAsync = this.sendAsync.bind(this);
+        this._warnOfDeprecation = this._warnOfDeprecation.bind(this);
+        this._metamask = this._getExperimentalApi();
+        // handle JSON-RPC notifications
+        this._jsonRpcConnection.events.on('notification', (payload) => {
+            const { method } = payload;
+            if (utils_1.EMITTED_NOTIFICATIONS.includes(method)) {
+                // deprecated
+                // emitted here because that was the original order
+                this.emit('data', payload);
+                // deprecated
+                this.emit('notification', payload.params.result);
+            }
+        });
+        // send website metadata
+        if (shouldSendMetadata) {
+            if (document.readyState === 'complete') {
+                siteMetadata_1.default(this._rpcEngine, this._log);
+            }
+            else {
+                const domContentLoadedHandler = () => {
+                    siteMetadata_1.default(this._rpcEngine, this._log);
+                    window.removeEventListener('DOMContentLoaded', domContentLoadedHandler);
+                };
+                window.addEventListener('DOMContentLoaded', domContentLoadedHandler);
+            }
+        }
+    }
+    //====================
+    // Public Methods
+    //====================
+    /**
+     * Submits an RPC request per the given JSON-RPC request object.
+     *
+     * @param payload - The RPC request object.
+     * @param cb - The callback function.
+     */
+    sendAsync(payload, callback) {
+        this._rpcRequest(payload, callback);
+    }
+    /**
+     * We override the following event methods so that we can warn consumers
+     * about deprecated events:
+     *   addListener, on, once, prependListener, prependOnceListener
+     */
+    addListener(eventName, listener) {
+        this._warnOfDeprecation(eventName);
+        return super.addListener(eventName, listener);
+    }
+    on(eventName, listener) {
+        this._warnOfDeprecation(eventName);
+        return super.on(eventName, listener);
+    }
+    once(eventName, listener) {
+        this._warnOfDeprecation(eventName);
+        return super.once(eventName, listener);
+    }
+    prependListener(eventName, listener) {
+        this._warnOfDeprecation(eventName);
+        return super.prependListener(eventName, listener);
+    }
+    prependOnceListener(eventName, listener) {
+        this._warnOfDeprecation(eventName);
+        return super.prependOnceListener(eventName, listener);
+    }
+    //====================
+    // Private Methods
+    //====================
+    /**
+     * When the provider becomes disconnected, updates internal state and emits
+     * required events. Idempotent with respect to the isRecoverable parameter.
+     *
+     * Error codes per the CloseEvent status codes as required by EIP-1193:
+     * https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent#Status_codes
+     *
+     * @param isRecoverable - Whether the disconnection is recoverable.
+     * @param errorMessage - A custom error message.
+     * @emits MetaMaskInpageProvider#disconnect
+     */
+    _handleDisconnect(isRecoverable, errorMessage) {
+        super._handleDisconnect(isRecoverable, errorMessage);
+        if (this.networkVersion && !isRecoverable) {
+            this.networkVersion = null;
+        }
+    }
+    /**
+     * Warns of deprecation for the given event, if applicable.
+     */
+    _warnOfDeprecation(eventName) {
+        var _a;
+        if (((_a = this._sentWarnings) === null || _a === void 0 ? void 0 : _a.events[eventName]) === false) {
+            this._log.warn(messages_1.default.warnings.events[eventName]);
+            this._sentWarnings.events[eventName] = true;
+        }
+    }
+    //====================
+    // Deprecated Methods
+    //====================
+    /**
+     * Equivalent to: ethereum.request('eth_requestAccounts')
+     *
+     * @deprecated Use request({ method: 'eth_requestAccounts' }) instead.
+     * @returns A promise that resolves to an array of addresses.
+     */
+    enable() {
+        if (!this._sentWarnings.enable) {
+            this._log.warn(messages_1.default.warnings.enableDeprecation);
+            this._sentWarnings.enable = true;
+        }
+        return new Promise((resolve, reject) => {
+            try {
+                this._rpcRequest({ method: 'eth_requestAccounts', params: [] }, utils_1.getRpcPromiseCallback(resolve, reject));
+            }
+            catch (error) {
+                reject(error);
+            }
+        });
+    }
+    send(methodOrPayload, callbackOrArgs) {
+        if (!this._sentWarnings.send) {
+            this._log.warn(messages_1.default.warnings.sendDeprecation);
+            this._sentWarnings.send = true;
+        }
+        if (typeof methodOrPayload === 'string' &&
+            (!callbackOrArgs || Array.isArray(callbackOrArgs))) {
+            return new Promise((resolve, reject) => {
+                try {
+                    this._rpcRequest({ method: methodOrPayload, params: callbackOrArgs }, utils_1.getRpcPromiseCallback(resolve, reject, false));
+                }
+                catch (error) {
+                    reject(error);
+                }
+            });
+        }
+        else if (methodOrPayload &&
+            typeof methodOrPayload === 'object' &&
+            typeof callbackOrArgs === 'function') {
+            return this._rpcRequest(methodOrPayload, callbackOrArgs);
+        }
+        return this._sendSync(methodOrPayload);
+    }
+    /**
+     * Internal backwards compatibility method, used in send.
+     *
+     * @deprecated
+     */
+    _sendSync(payload) {
+        let result;
+        switch (payload.method) {
+            case 'eth_accounts':
+                result = this.selectedAddress ? [this.selectedAddress] : [];
+                break;
+            case 'eth_coinbase':
+                result = this.selectedAddress || null;
+                break;
+            case 'eth_uninstallFilter':
+                this._rpcRequest(payload, utils_1.NOOP);
+                result = true;
+                break;
+            case 'net_version':
+                result = this.networkVersion || null;
+                break;
+            default:
+                throw new Error(messages_1.default.errors.unsupportedSync(payload.method));
+        }
+        return {
+            id: payload.id,
+            jsonrpc: payload.jsonrpc,
+            result,
+        };
+    }
+    /**
+     * Constructor helper.
+     * Gets experimental _metamask API as Proxy, so that we can warn consumers
+     * about its experiment nature.
+     */
+    _getExperimentalApi() {
+        return new Proxy({
+            /**
+             * Determines if MetaMask is unlocked by the user.
+             *
+             * @returns Promise resolving to true if MetaMask is currently unlocked
+             */
+            isUnlocked: async () => {
+                if (!this._state.initialized) {
+                    await new Promise((resolve) => {
+                        this.on('_initialized', () => resolve());
+                    });
+                }
+                return this._state.isUnlocked;
+            },
+            /**
+             * Make a batch RPC request.
+             */
+            requestBatch: async (requests) => {
+                if (!Array.isArray(requests)) {
+                    throw eth_rpc_errors_1.ethErrors.rpc.invalidRequest({
+                        message: 'Batch requests must be made with an array of request objects.',
+                        data: requests,
+                    });
+                }
+                return new Promise((resolve, reject) => {
+                    this._rpcRequest(requests, utils_1.getRpcPromiseCallback(resolve, reject));
+                });
+            },
+        }, {
+            get: (obj, prop, ...args) => {
+                if (!this._sentWarnings.experimentalMethods) {
+                    this._log.warn(messages_1.default.warnings.experimentalMethods);
+                    this._sentWarnings.experimentalMethods = true;
+                }
+                return Reflect.get(obj, prop, ...args);
+            },
+        });
+    }
+}
+exports.default = MetaMaskInpageProvider;
+
+},{"./BaseProvider":296,"./messages":302,"./siteMetadata":304,"./utils":305,"eth-rpc-errors":435}],298:[function(require,module,exports){
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const extension_port_stream_1 = __importDefault(require("extension-port-stream"));
+const detect_browser_1 = require("detect-browser");
+const BaseProvider_1 = __importDefault(require("../BaseProvider"));
+const external_extension_config_json_1 = __importDefault(require("./external-extension-config.json"));
+const browser = detect_browser_1.detect();
+function createMetaMaskExternalExtensionProvider() {
+    let provider;
+    try {
+        const currentMetaMaskId = getMetaMaskId();
+        const metamaskPort = chrome.runtime.connect(currentMetaMaskId);
+        const pluginStream = new extension_port_stream_1.default(metamaskPort);
+        provider = new BaseProvider_1.default(pluginStream);
+    }
+    catch (e) {
+        console.dir(`Metamask connect error `, e);
+        throw e;
+    }
+    return provider;
+}
+exports.default = createMetaMaskExternalExtensionProvider;
+function getMetaMaskId() {
+    switch (browser === null || browser === void 0 ? void 0 : browser.name) {
+        case 'chrome':
+            return external_extension_config_json_1.default.CHROME_ID;
+        case 'firefox':
+            return external_extension_config_json_1.default.FIREFOX_ID;
+        default:
+            return external_extension_config_json_1.default.CHROME_ID;
+    }
+}
+
+},{"../BaseProvider":296,"./external-extension-config.json":299,"detect-browser":306,"extension-port-stream":307}],299:[function(require,module,exports){
+module.exports={
+    "CHROME_ID": "nkbihfbeogaeaoehlefnkodbefgpgknn",
+    "FIREFOX_ID": "webextension@metamask.io"
+}
+
+},{}],300:[function(require,module,exports){
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.createExternalExtensionProvider = exports.shimWeb3 = exports.setGlobalProvider = exports.BaseProvider = exports.MetaMaskInpageProvider = exports.initializeProvider = void 0;
+const MetaMaskInpageProvider_1 = __importDefault(require("./MetaMaskInpageProvider"));
+exports.MetaMaskInpageProvider = MetaMaskInpageProvider_1.default;
+const createExternalExtensionProvider_1 = __importDefault(require("./extension-provider/createExternalExtensionProvider"));
+exports.createExternalExtensionProvider = createExternalExtensionProvider_1.default;
+const BaseProvider_1 = __importDefault(require("./BaseProvider"));
+exports.BaseProvider = BaseProvider_1.default;
+const initializeInpageProvider_1 = require("./initializeInpageProvider");
+Object.defineProperty(exports, "initializeProvider", { enumerable: true, get: function () { return initializeInpageProvider_1.initializeProvider; } });
+Object.defineProperty(exports, "setGlobalProvider", { enumerable: true, get: function () { return initializeInpageProvider_1.setGlobalProvider; } });
+const shimWeb3_1 = __importDefault(require("./shimWeb3"));
+exports.shimWeb3 = shimWeb3_1.default;
+
+},{"./BaseProvider":296,"./MetaMaskInpageProvider":297,"./extension-provider/createExternalExtensionProvider":298,"./initializeInpageProvider":301,"./shimWeb3":303}],301:[function(require,module,exports){
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.setGlobalProvider = exports.initializeProvider = void 0;
+const MetaMaskInpageProvider_1 = __importDefault(require("./MetaMaskInpageProvider"));
+const shimWeb3_1 = __importDefault(require("./shimWeb3"));
+/**
+ * Initializes a MetaMaskInpageProvider and (optionally) assigns it as window.ethereum.
+ *
+ * @param options - An options bag.
+ * @param options.connectionStream - A Node.js stream.
+ * @param options.jsonRpcStreamName - The name of the internal JSON-RPC stream.
+ * @param options.maxEventListeners - The maximum number of event listeners.
+ * @param options.shouldSendMetadata - Whether the provider should send page metadata.
+ * @param options.shouldSetOnWindow - Whether the provider should be set as window.ethereum.
+ * @param options.shouldShimWeb3 - Whether a window.web3 shim should be injected.
+ * @returns The initialized provider (whether set or not).
+ */
+function initializeProvider({ connectionStream, jsonRpcStreamName, logger = console, maxEventListeners = 100, shouldSendMetadata = true, shouldSetOnWindow = true, shouldShimWeb3 = false, }) {
+    let provider = new MetaMaskInpageProvider_1.default(connectionStream, {
+        jsonRpcStreamName,
+        logger,
+        maxEventListeners,
+        shouldSendMetadata,
+    });
+    provider = new Proxy(provider, {
+        // some common libraries, e.g. web3@1.x, mess with our API
+        deleteProperty: () => true,
+    });
+    if (shouldSetOnWindow) {
+        setGlobalProvider(provider);
+    }
+    if (shouldShimWeb3) {
+        shimWeb3_1.default(provider, logger);
+    }
+    return provider;
+}
+exports.initializeProvider = initializeProvider;
+/**
+ * Sets the given provider instance as window.ethereum and dispatches the
+ * 'ethereum#initialized' event on window.
+ *
+ * @param providerInstance - The provider instance.
+ */
+function setGlobalProvider(providerInstance) {
+    window.ethereum = providerInstance;
+    window.dispatchEvent(new Event('ethereum#initialized'));
+}
+exports.setGlobalProvider = setGlobalProvider;
+
+},{"./MetaMaskInpageProvider":297,"./shimWeb3":303}],302:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const messages = {
+    errors: {
+        disconnected: () => 'MetaMask: Disconnected from chain. Attempting to connect.',
+        permanentlyDisconnected: () => 'MetaMask: Disconnected from MetaMask background. Page reload required.',
+        sendSiteMetadata: () => `MetaMask: Failed to send site metadata. This is an internal error, please report this bug.`,
+        unsupportedSync: (method) => `MetaMask: The MetaMask Ethereum provider does not support synchronous methods like ${method} without a callback parameter.`,
+        invalidDuplexStream: () => 'Must provide a Node.js-style duplex stream.',
+        invalidRequestArgs: () => `Expected a single, non-array, object argument.`,
+        invalidRequestMethod: () => `'args.method' must be a non-empty string.`,
+        invalidRequestParams: () => `'args.params' must be an object or array if provided.`,
+        invalidLoggerObject: () => `'args.logger' must be an object if provided.`,
+        invalidLoggerMethod: (method) => `'args.logger' must include required method '${method}'.`,
+    },
+    info: {
+        connected: (chainId) => `MetaMask: Connected to chain with ID "${chainId}".`,
+    },
+    warnings: {
+        // deprecated methods
+        enableDeprecation: `MetaMask: 'ethereum.enable()' is deprecated and may be removed in the future. Please use the 'eth_requestAccounts' RPC method instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1102`,
+        sendDeprecation: `MetaMask: 'ethereum.send(...)' is deprecated and may be removed in the future. Please use 'ethereum.sendAsync(...)' or 'ethereum.request(...)' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193`,
+        // deprecated events
+        events: {
+            close: `MetaMask: The event 'close' is deprecated and may be removed in the future. Please use 'disconnect' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193#disconnect`,
+            data: `MetaMask: The event 'data' is deprecated and will be removed in the future. Use 'message' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193#message`,
+            networkChanged: `MetaMask: The event 'networkChanged' is deprecated and may be removed in the future. Use 'chainChanged' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193#chainchanged`,
+            notification: `MetaMask: The event 'notification' is deprecated and may be removed in the future. Use 'message' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193#message`,
+        },
+        // misc
+        experimentalMethods: `MetaMask: 'ethereum._metamask' exposes non-standard, experimental methods. They may be removed or changed without warning.`,
+    },
+};
+exports.default = messages;
+
+},{}],303:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+/**
+ * If no existing window.web3 is found, this function injects a web3 "shim" to
+ * not break dapps that rely on window.web3.currentProvider.
+ *
+ * @param provider - The provider to set as window.web3.currentProvider.
+ * @param log - The logging API to use.
+ */
+function shimWeb3(provider, log = console) {
+    let loggedCurrentProvider = false;
+    let loggedMissingProperty = false;
+    if (!window.web3) {
+        const SHIM_IDENTIFIER = '__isMetaMaskShim__';
+        let web3Shim = { currentProvider: provider };
+        Object.defineProperty(web3Shim, SHIM_IDENTIFIER, {
+            value: true,
+            enumerable: true,
+            configurable: false,
+            writable: false,
+        });
+        web3Shim = new Proxy(web3Shim, {
+            get: (target, property, ...args) => {
+                if (property === 'currentProvider' && !loggedCurrentProvider) {
+                    loggedCurrentProvider = true;
+                    log.warn('You are accessing the MetaMask window.web3.currentProvider shim. This property is deprecated; use window.ethereum instead. For details, see: https://docs.metamask.io/guide/provider-migration.html#replacing-window-web3');
+                }
+                else if (property !== 'currentProvider' &&
+                    property !== SHIM_IDENTIFIER &&
+                    !loggedMissingProperty) {
+                    loggedMissingProperty = true;
+                    log.error(`MetaMask no longer injects web3. For details, see: https://docs.metamask.io/guide/provider-migration.html#replacing-window-web3`);
+                    provider
+                        .request({ method: 'metamask_logWeb3ShimUsage' })
+                        .catch((error) => {
+                        log.debug('MetaMask: Failed to log web3 shim usage.', error);
+                    });
+                }
+                return Reflect.get(target, property, ...args);
+            },
+            set: (...args) => {
+                log.warn('You are accessing the MetaMask window.web3 shim. This object is deprecated; use window.ethereum instead. For details, see: https://docs.metamask.io/guide/provider-migration.html#replacing-window-web3');
+                return Reflect.set(...args);
+            },
+        });
+        Object.defineProperty(window, 'web3', {
+            value: web3Shim,
+            enumerable: false,
+            configurable: true,
+            writable: true,
+        });
+    }
+}
+exports.default = shimWeb3;
+
+},{}],304:[function(require,module,exports){
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const messages_1 = __importDefault(require("./messages"));
+const utils_1 = require("./utils");
+/**
+ * Sends site metadata over an RPC request.
+ *
+ * @param engine - The JSON RPC Engine to send metadata over.
+ * @param log - The logging API to use.
+ */
+async function sendSiteMetadata(engine, log) {
+    try {
+        const domainMetadata = await getSiteMetadata();
+        // call engine.handle directly to avoid normal RPC request handling
+        engine.handle({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'metamask_sendDomainMetadata',
+            params: domainMetadata,
+        }, utils_1.NOOP);
+    }
+    catch (error) {
+        log.error({
+            message: messages_1.default.errors.sendSiteMetadata(),
+            originalError: error,
+        });
+    }
+}
+exports.default = sendSiteMetadata;
+/**
+ * Gets site metadata and returns it
+ *
+ */
+async function getSiteMetadata() {
+    return {
+        name: getSiteName(window),
+        icon: await getSiteIcon(window),
+    };
+}
+/**
+ * Extracts a name for the site from the DOM
+ */
+function getSiteName(windowObject) {
+    const { document } = windowObject;
+    const siteName = document.querySelector('head > meta[property="og:site_name"]');
+    if (siteName) {
+        return siteName.content;
+    }
+    const metaTitle = document.querySelector('head > meta[name="title"]');
+    if (metaTitle) {
+        return metaTitle.content;
+    }
+    if (document.title && document.title.length > 0) {
+        return document.title;
+    }
+    return window.location.hostname;
+}
+/**
+ * Extracts an icon for the site from the DOM
+ * @returns an icon URL
+ */
+async function getSiteIcon(windowObject) {
+    const { document } = windowObject;
+    const icons = document.querySelectorAll('head > link[rel~="icon"]');
+    for (const icon of icons) {
+        if (icon && (await imgExists(icon.href))) {
+            return icon.href;
+        }
+    }
+    return null;
+}
+/**
+ * Returns whether the given image URL exists
+ * @param url - the url of the image
+ * @returns Whether the image exists.
+ */
+function imgExists(url) {
+    return new Promise((resolve, reject) => {
+        try {
+            const img = document.createElement('img');
+            img.onload = () => resolve(true);
+            img.onerror = () => resolve(false);
+            img.src = url;
+        }
+        catch (e) {
+            reject(e);
+        }
+    });
+}
+
+},{"./messages":302,"./utils":305}],305:[function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.EMITTED_NOTIFICATIONS = exports.NOOP = exports.logStreamDisconnectWarning = exports.getRpcPromiseCallback = exports.createErrorMiddleware = void 0;
+const eth_rpc_errors_1 = require("eth-rpc-errors");
+// utility functions
+/**
+ * json-rpc-engine middleware that logs RPC errors and and validates req.method.
+ *
+ * @param log - The logging API to use.
+ * @returns  json-rpc-engine middleware function
+ */
+function createErrorMiddleware(log) {
+    return (req, res, next) => {
+        // json-rpc-engine will terminate the request when it notices this error
+        if (typeof req.method !== 'string' || !req.method) {
+            res.error = eth_rpc_errors_1.ethErrors.rpc.invalidRequest({
+                message: `The request 'method' must be a non-empty string.`,
+                data: req,
+            });
+        }
+        next((done) => {
+            const { error } = res;
+            if (!error) {
+                return done();
+            }
+            log.error(`MetaMask - RPC Error: ${error.message}`, error);
+            return done();
+        });
+    };
+}
+exports.createErrorMiddleware = createErrorMiddleware;
+// resolve response.result or response, reject errors
+const getRpcPromiseCallback = (resolve, reject, unwrapResult = true) => (error, response) => {
+    if (error || response.error) {
+        reject(error || response.error);
+    }
+    else {
+        !unwrapResult || Array.isArray(response)
+            ? resolve(response)
+            : resolve(response.result);
+    }
+};
+exports.getRpcPromiseCallback = getRpcPromiseCallback;
+/**
+ * Logs a stream disconnection error. Emits an 'error' if given an
+ * EventEmitter that has listeners for the 'error' event.
+ *
+ * @param log - The logging API to use.
+ * @param remoteLabel - The label of the disconnected stream.
+ * @param error - The associated error to log.
+ * @param emitter - The logging API to use.
+ */
+function logStreamDisconnectWarning(log, remoteLabel, error, emitter) {
+    let warningMsg = `MetaMask: Lost connection to "${remoteLabel}".`;
+    if (error === null || error === void 0 ? void 0 : error.stack) {
+        warningMsg += `\n${error.stack}`;
+    }
+    log.warn(warningMsg);
+    if (emitter && emitter.listenerCount('error') > 0) {
+        emitter.emit('error', warningMsg);
+    }
+}
+exports.logStreamDisconnectWarning = logStreamDisconnectWarning;
+const NOOP = () => undefined;
+exports.NOOP = NOOP;
+// constants
+exports.EMITTED_NOTIFICATIONS = [
+    'eth_subscription',
+];
+
+},{"eth-rpc-errors":435}],306:[function(require,module,exports){
+(function (process){(function (){
+"use strict";
+var __spreadArrays = (this && this.__spreadArrays) || function () {
+    for (var s = 0, i = 0, il = arguments.length; i < il; i++) s += arguments[i].length;
+    for (var r = Array(s), k = 0, i = 0; i < il; i++)
+        for (var a = arguments[i], j = 0, jl = a.length; j < jl; j++, k++)
+            r[k] = a[j];
+    return r;
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+var BrowserInfo = /** @class */ (function () {
+    function BrowserInfo(name, version, os) {
+        this.name = name;
+        this.version = version;
+        this.os = os;
+        this.type = 'browser';
+    }
+    return BrowserInfo;
+}());
+exports.BrowserInfo = BrowserInfo;
+var NodeInfo = /** @class */ (function () {
+    function NodeInfo(version) {
+        this.version = version;
+        this.type = 'node';
+        this.name = 'node';
+        this.os = process.platform;
+    }
+    return NodeInfo;
+}());
+exports.NodeInfo = NodeInfo;
+var SearchBotDeviceInfo = /** @class */ (function () {
+    function SearchBotDeviceInfo(name, version, os, bot) {
+        this.name = name;
+        this.version = version;
+        this.os = os;
+        this.bot = bot;
+        this.type = 'bot-device';
+    }
+    return SearchBotDeviceInfo;
+}());
+exports.SearchBotDeviceInfo = SearchBotDeviceInfo;
+var BotInfo = /** @class */ (function () {
+    function BotInfo() {
+        this.type = 'bot';
+        this.bot = true; // NOTE: deprecated test name instead
+        this.name = 'bot';
+        this.version = null;
+        this.os = null;
+    }
+    return BotInfo;
+}());
+exports.BotInfo = BotInfo;
+var ReactNativeInfo = /** @class */ (function () {
+    function ReactNativeInfo() {
+        this.type = 'react-native';
+        this.name = 'react-native';
+        this.version = null;
+        this.os = null;
+    }
+    return ReactNativeInfo;
+}());
+exports.ReactNativeInfo = ReactNativeInfo;
+// tslint:disable-next-line:max-line-length
+var SEARCHBOX_UA_REGEX = /alexa|bot|crawl(er|ing)|facebookexternalhit|feedburner|google web preview|nagios|postrank|pingdom|slurp|spider|yahoo!|yandex/;
+var SEARCHBOT_OS_REGEX = /(nuhk|Googlebot|Yammybot|Openbot|Slurp|MSNBot|Ask\ Jeeves\/Teoma|ia_archiver)/;
+var REQUIRED_VERSION_PARTS = 3;
+var userAgentRules = [
+    ['aol', /AOLShield\/([0-9\._]+)/],
+    ['edge', /Edge\/([0-9\._]+)/],
+    ['edge-ios', /EdgiOS\/([0-9\._]+)/],
+    ['yandexbrowser', /YaBrowser\/([0-9\._]+)/],
+    ['kakaotalk', /KAKAOTALK\s([0-9\.]+)/],
+    ['samsung', /SamsungBrowser\/([0-9\.]+)/],
+    ['silk', /\bSilk\/([0-9._-]+)\b/],
+    ['miui', /MiuiBrowser\/([0-9\.]+)$/],
+    ['beaker', /BeakerBrowser\/([0-9\.]+)/],
+    ['edge-chromium', /EdgA?\/([0-9\.]+)/],
+    [
+        'chromium-webview',
+        /(?!Chrom.*OPR)wv\).*Chrom(?:e|ium)\/([0-9\.]+)(:?\s|$)/,
+    ],
+    ['chrome', /(?!Chrom.*OPR)Chrom(?:e|ium)\/([0-9\.]+)(:?\s|$)/],
+    ['phantomjs', /PhantomJS\/([0-9\.]+)(:?\s|$)/],
+    ['crios', /CriOS\/([0-9\.]+)(:?\s|$)/],
+    ['firefox', /Firefox\/([0-9\.]+)(?:\s|$)/],
+    ['fxios', /FxiOS\/([0-9\.]+)/],
+    ['opera-mini', /Opera Mini.*Version\/([0-9\.]+)/],
+    ['opera', /Opera\/([0-9\.]+)(?:\s|$)/],
+    ['opera', /OPR\/([0-9\.]+)(:?\s|$)/],
+    ['ie', /Trident\/7\.0.*rv\:([0-9\.]+).*\).*Gecko$/],
+    ['ie', /MSIE\s([0-9\.]+);.*Trident\/[4-7].0/],
+    ['ie', /MSIE\s(7\.0)/],
+    ['bb10', /BB10;\sTouch.*Version\/([0-9\.]+)/],
+    ['android', /Android\s([0-9\.]+)/],
+    ['ios', /Version\/([0-9\._]+).*Mobile.*Safari.*/],
+    ['safari', /Version\/([0-9\._]+).*Safari/],
+    ['facebook', /FBAV\/([0-9\.]+)/],
+    ['instagram', /Instagram\s([0-9\.]+)/],
+    ['ios-webview', /AppleWebKit\/([0-9\.]+).*Mobile/],
+    ['ios-webview', /AppleWebKit\/([0-9\.]+).*Gecko\)$/],
+    ['searchbot', SEARCHBOX_UA_REGEX],
+];
+var operatingSystemRules = [
+    ['iOS', /iP(hone|od|ad)/],
+    ['Android OS', /Android/],
+    ['BlackBerry OS', /BlackBerry|BB10/],
+    ['Windows Mobile', /IEMobile/],
+    ['Amazon OS', /Kindle/],
+    ['Windows 3.11', /Win16/],
+    ['Windows 95', /(Windows 95)|(Win95)|(Windows_95)/],
+    ['Windows 98', /(Windows 98)|(Win98)/],
+    ['Windows 2000', /(Windows NT 5.0)|(Windows 2000)/],
+    ['Windows XP', /(Windows NT 5.1)|(Windows XP)/],
+    ['Windows Server 2003', /(Windows NT 5.2)/],
+    ['Windows Vista', /(Windows NT 6.0)/],
+    ['Windows 7', /(Windows NT 6.1)/],
+    ['Windows 8', /(Windows NT 6.2)/],
+    ['Windows 8.1', /(Windows NT 6.3)/],
+    ['Windows 10', /(Windows NT 10.0)/],
+    ['Windows ME', /Windows ME/],
+    ['Open BSD', /OpenBSD/],
+    ['Sun OS', /SunOS/],
+    ['Chrome OS', /CrOS/],
+    ['Linux', /(Linux)|(X11)/],
+    ['Mac OS', /(Mac_PowerPC)|(Macintosh)/],
+    ['QNX', /QNX/],
+    ['BeOS', /BeOS/],
+    ['OS/2', /OS\/2/],
+];
+function detect(userAgent) {
+    if (!!userAgent) {
+        return parseUserAgent(userAgent);
+    }
+    if (typeof document === 'undefined' &&
+        typeof navigator !== 'undefined' &&
+        navigator.product === 'ReactNative') {
+        return new ReactNativeInfo();
+    }
+    if (typeof navigator !== 'undefined') {
+        return parseUserAgent(navigator.userAgent);
+    }
+    return getNodeVersion();
+}
+exports.detect = detect;
+function matchUserAgent(ua) {
+    // opted for using reduce here rather than Array#first with a regex.test call
+    // this is primarily because using the reduce we only perform the regex
+    // execution once rather than once for the test and for the exec again below
+    // probably something that needs to be benchmarked though
+    return (ua !== '' &&
+        userAgentRules.reduce(function (matched, _a) {
+            var browser = _a[0], regex = _a[1];
+            if (matched) {
+                return matched;
+            }
+            var uaMatch = regex.exec(ua);
+            return !!uaMatch && [browser, uaMatch];
+        }, false));
+}
+function browserName(ua) {
+    var data = matchUserAgent(ua);
+    return data ? data[0] : null;
+}
+exports.browserName = browserName;
+function parseUserAgent(ua) {
+    var matchedRule = matchUserAgent(ua);
+    if (!matchedRule) {
+        return null;
+    }
+    var name = matchedRule[0], match = matchedRule[1];
+    if (name === 'searchbot') {
+        return new BotInfo();
+    }
+    var versionParts = match[1] && match[1].split(/[._]/).slice(0, 3);
+    if (versionParts) {
+        if (versionParts.length < REQUIRED_VERSION_PARTS) {
+            versionParts = __spreadArrays(versionParts, createVersionParts(REQUIRED_VERSION_PARTS - versionParts.length));
+        }
+    }
+    else {
+        versionParts = [];
+    }
+    var version = versionParts.join('.');
+    var os = detectOS(ua);
+    var searchBotMatch = SEARCHBOT_OS_REGEX.exec(ua);
+    if (searchBotMatch && searchBotMatch[1]) {
+        return new SearchBotDeviceInfo(name, version, os, searchBotMatch[1]);
+    }
+    return new BrowserInfo(name, version, os);
+}
+exports.parseUserAgent = parseUserAgent;
+function detectOS(ua) {
+    for (var ii = 0, count = operatingSystemRules.length; ii < count; ii++) {
+        var _a = operatingSystemRules[ii], os = _a[0], regex = _a[1];
+        var match = regex.exec(ua);
+        if (match) {
+            return os;
+        }
+    }
+    return null;
+}
+exports.detectOS = detectOS;
+function getNodeVersion() {
+    var isNode = typeof process !== 'undefined' && process.version;
+    return isNode ? new NodeInfo(process.version.slice(1)) : null;
+}
+exports.getNodeVersion = getNodeVersion;
+function createVersionParts(count) {
+    var output = [];
+    for (var ii = 0; ii < count; ii++) {
+        output.push('0');
+    }
+    return output;
+}
+
+}).call(this)}).call(this,require('_process'))
+},{"_process":173}],307:[function(require,module,exports){
+(function (Buffer){(function (){
+"use strict";
+const stream_1 = require("stream");
+module.exports = class PortDuplexStream extends stream_1.Duplex {
+    /**
+     * @param port - An instance of WebExtensions Runtime.Port. See:
+     * {@link https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/API/runtime/Port}
+     */
+    constructor(port) {
+        super({ objectMode: true });
+        this._port = port;
+        this._port.onMessage.addListener((msg) => this._onMessage(msg));
+        this._port.onDisconnect.addListener(() => this._onDisconnect());
+    }
+    /**
+     * Callback triggered when a message is received from
+     * the remote Port associated with this Stream.
+     *
+     * @param msg - Payload from the onMessage listener of the port
+     */
+    _onMessage(msg) {
+        if (Buffer.isBuffer(msg)) {
+            const data = Buffer.from(msg);
+            this.push(data);
+        }
+        else {
+            this.push(msg);
+        }
+    }
+    /**
+     * Callback triggered when the remote Port associated with this Stream
+     * disconnects.
+     */
+    _onDisconnect() {
+        this.destroy();
+    }
+    /**
+     * Explicitly sets read operations to a no-op.
+     */
+    _read() {
+        return undefined;
+    }
+    /**
+     * Called internally when data should be written to this writable stream.
+     *
+     * @param msg - Arbitrary object to write
+     * @param encoding - Encoding to use when writing payload
+     * @param cb - Called when writing is complete or an error occurs
+     */
+    _write(msg, _encoding, cb) {
+        try {
+            if (Buffer.isBuffer(msg)) {
+                const data = msg.toJSON();
+                data._isBuffer = true;
+                this._port.postMessage(data);
+            }
+            else {
+                this._port.postMessage(msg);
+            }
+        }
+        catch (error) {
+            return cb(new Error('PortDuplexStream - disconnected'));
+        }
+        return cb();
+    }
+};
+
+}).call(this)}).call(this,require("buffer").Buffer)
+},{"buffer":69,"stream":198}],308:[function(require,module,exports){
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
 exports.ObjectMultiplex = void 0;
 const readable_stream_1 = require("readable-stream");
 const end_of_stream_1 = __importDefault(require("end-of-stream"));
@@ -37744,7 +38990,7 @@ function anyStreamEnd(stream, _cb) {
     end_of_stream_1.default(stream, { writable: false }, cb);
 }
 
-},{"./Substream":297,"end-of-stream":414,"once":589,"readable-stream":621}],297:[function(require,module,exports){
+},{"./Substream":309,"end-of-stream":426,"once":568,"readable-stream":600}],309:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.Substream = void 0;
@@ -37778,12 +39024,12 @@ class Substream extends readable_stream_1.Duplex {
 }
 exports.Substream = Substream;
 
-},{"readable-stream":621}],298:[function(require,module,exports){
+},{"readable-stream":600}],310:[function(require,module,exports){
 "use strict";
 const ObjectMultiplex_1 = require("./ObjectMultiplex");
 module.exports = ObjectMultiplex_1.ObjectMultiplex;
 
-},{"./ObjectMultiplex":296}],299:[function(require,module,exports){
+},{"./ObjectMultiplex":308}],311:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const events_1 = require("events");
@@ -37851,35 +39097,35 @@ class SafeEventEmitter extends events_1.EventEmitter {
 }
 exports.default = SafeEventEmitter;
 
-},{"events":110}],300:[function(require,module,exports){
+},{"events":110}],312:[function(require,module,exports){
 arguments[4][2][0].apply(exports,arguments)
-},{"./asn1/api":301,"./asn1/base":303,"./asn1/constants":307,"./asn1/decoders":309,"./asn1/encoders":312,"bn.js":315,"dup":2}],301:[function(require,module,exports){
+},{"./asn1/api":313,"./asn1/base":315,"./asn1/constants":319,"./asn1/decoders":321,"./asn1/encoders":324,"bn.js":327,"dup":2}],313:[function(require,module,exports){
 arguments[4][3][0].apply(exports,arguments)
-},{"./decoders":309,"./encoders":312,"dup":3,"inherits":506}],302:[function(require,module,exports){
+},{"./decoders":321,"./encoders":324,"dup":3,"inherits":517}],314:[function(require,module,exports){
 arguments[4][4][0].apply(exports,arguments)
-},{"../base/reporter":305,"dup":4,"inherits":506,"safer-buffer":626}],303:[function(require,module,exports){
+},{"../base/reporter":317,"dup":4,"inherits":517,"safer-buffer":604}],315:[function(require,module,exports){
 arguments[4][5][0].apply(exports,arguments)
-},{"./buffer":302,"./node":304,"./reporter":305,"dup":5}],304:[function(require,module,exports){
+},{"./buffer":314,"./node":316,"./reporter":317,"dup":5}],316:[function(require,module,exports){
 arguments[4][6][0].apply(exports,arguments)
-},{"../base/buffer":302,"../base/reporter":305,"dup":6,"minimalistic-assert":559}],305:[function(require,module,exports){
+},{"../base/buffer":314,"../base/reporter":317,"dup":6,"minimalistic-assert":541}],317:[function(require,module,exports){
 arguments[4][7][0].apply(exports,arguments)
-},{"dup":7,"inherits":506}],306:[function(require,module,exports){
+},{"dup":7,"inherits":517}],318:[function(require,module,exports){
 arguments[4][8][0].apply(exports,arguments)
-},{"dup":8}],307:[function(require,module,exports){
+},{"dup":8}],319:[function(require,module,exports){
 arguments[4][9][0].apply(exports,arguments)
-},{"./der":306,"dup":9}],308:[function(require,module,exports){
+},{"./der":318,"dup":9}],320:[function(require,module,exports){
 arguments[4][10][0].apply(exports,arguments)
-},{"../base/buffer":302,"../base/node":304,"../constants/der":306,"bn.js":315,"dup":10,"inherits":506}],309:[function(require,module,exports){
+},{"../base/buffer":314,"../base/node":316,"../constants/der":318,"bn.js":327,"dup":10,"inherits":517}],321:[function(require,module,exports){
 arguments[4][11][0].apply(exports,arguments)
-},{"./der":308,"./pem":310,"dup":11}],310:[function(require,module,exports){
+},{"./der":320,"./pem":322,"dup":11}],322:[function(require,module,exports){
 arguments[4][12][0].apply(exports,arguments)
-},{"./der":308,"dup":12,"inherits":506,"safer-buffer":626}],311:[function(require,module,exports){
+},{"./der":320,"dup":12,"inherits":517,"safer-buffer":604}],323:[function(require,module,exports){
 arguments[4][13][0].apply(exports,arguments)
-},{"../base/node":304,"../constants/der":306,"dup":13,"inherits":506,"safer-buffer":626}],312:[function(require,module,exports){
+},{"../base/node":316,"../constants/der":318,"dup":13,"inherits":517,"safer-buffer":604}],324:[function(require,module,exports){
 arguments[4][14][0].apply(exports,arguments)
-},{"./der":311,"./pem":313,"dup":14}],313:[function(require,module,exports){
+},{"./der":323,"./pem":325,"dup":14}],325:[function(require,module,exports){
 arguments[4][15][0].apply(exports,arguments)
-},{"./der":311,"dup":15,"inherits":506}],314:[function(require,module,exports){
+},{"./der":323,"dup":15,"inherits":517}],326:[function(require,module,exports){
 'use strict'
 // base-x encoding / decoding
 // Copyright (c) 2018 base-x contributors
@@ -38004,105 +39250,105 @@ function base (ALPHABET) {
 }
 module.exports = base
 
-},{"safe-buffer":624}],315:[function(require,module,exports){
+},{"safe-buffer":603}],327:[function(require,module,exports){
 arguments[4][16][0].apply(exports,arguments)
-},{"buffer":25,"dup":16}],316:[function(require,module,exports){
+},{"buffer":25,"dup":16}],328:[function(require,module,exports){
 arguments[4][24][0].apply(exports,arguments)
-},{"crypto":25,"dup":24}],317:[function(require,module,exports){
+},{"crypto":25,"dup":24}],329:[function(require,module,exports){
 arguments[4][26][0].apply(exports,arguments)
-},{"dup":26,"safe-buffer":624}],318:[function(require,module,exports){
+},{"dup":26,"safe-buffer":603}],330:[function(require,module,exports){
 arguments[4][27][0].apply(exports,arguments)
-},{"./aes":317,"./ghash":322,"./incr32":323,"buffer-xor":363,"cipher-base":373,"dup":27,"inherits":506,"safe-buffer":624}],319:[function(require,module,exports){
+},{"./aes":329,"./ghash":334,"./incr32":335,"buffer-xor":375,"cipher-base":385,"dup":27,"inherits":517,"safe-buffer":603}],331:[function(require,module,exports){
 arguments[4][28][0].apply(exports,arguments)
-},{"./decrypter":320,"./encrypter":321,"./modes/list.json":331,"dup":28}],320:[function(require,module,exports){
+},{"./decrypter":332,"./encrypter":333,"./modes/list.json":343,"dup":28}],332:[function(require,module,exports){
 arguments[4][29][0].apply(exports,arguments)
-},{"./aes":317,"./authCipher":318,"./modes":330,"./streamCipher":333,"cipher-base":373,"dup":29,"evp_bytestokey":468,"inherits":506,"safe-buffer":624}],321:[function(require,module,exports){
+},{"./aes":329,"./authCipher":330,"./modes":342,"./streamCipher":345,"cipher-base":385,"dup":29,"evp_bytestokey":479,"inherits":517,"safe-buffer":603}],333:[function(require,module,exports){
 arguments[4][30][0].apply(exports,arguments)
-},{"./aes":317,"./authCipher":318,"./modes":330,"./streamCipher":333,"cipher-base":373,"dup":30,"evp_bytestokey":468,"inherits":506,"safe-buffer":624}],322:[function(require,module,exports){
+},{"./aes":329,"./authCipher":330,"./modes":342,"./streamCipher":345,"cipher-base":385,"dup":30,"evp_bytestokey":479,"inherits":517,"safe-buffer":603}],334:[function(require,module,exports){
 arguments[4][31][0].apply(exports,arguments)
-},{"dup":31,"safe-buffer":624}],323:[function(require,module,exports){
+},{"dup":31,"safe-buffer":603}],335:[function(require,module,exports){
 arguments[4][32][0].apply(exports,arguments)
-},{"dup":32}],324:[function(require,module,exports){
+},{"dup":32}],336:[function(require,module,exports){
 arguments[4][33][0].apply(exports,arguments)
-},{"buffer-xor":363,"dup":33}],325:[function(require,module,exports){
+},{"buffer-xor":375,"dup":33}],337:[function(require,module,exports){
 arguments[4][34][0].apply(exports,arguments)
-},{"buffer-xor":363,"dup":34,"safe-buffer":624}],326:[function(require,module,exports){
+},{"buffer-xor":375,"dup":34,"safe-buffer":603}],338:[function(require,module,exports){
 arguments[4][35][0].apply(exports,arguments)
-},{"dup":35,"safe-buffer":624}],327:[function(require,module,exports){
+},{"dup":35,"safe-buffer":603}],339:[function(require,module,exports){
 arguments[4][36][0].apply(exports,arguments)
-},{"dup":36,"safe-buffer":624}],328:[function(require,module,exports){
+},{"dup":36,"safe-buffer":603}],340:[function(require,module,exports){
 arguments[4][37][0].apply(exports,arguments)
-},{"../incr32":323,"buffer-xor":363,"dup":37,"safe-buffer":624}],329:[function(require,module,exports){
+},{"../incr32":335,"buffer-xor":375,"dup":37,"safe-buffer":603}],341:[function(require,module,exports){
 arguments[4][38][0].apply(exports,arguments)
-},{"dup":38}],330:[function(require,module,exports){
+},{"dup":38}],342:[function(require,module,exports){
 arguments[4][39][0].apply(exports,arguments)
-},{"./cbc":324,"./cfb":325,"./cfb1":326,"./cfb8":327,"./ctr":328,"./ecb":329,"./list.json":331,"./ofb":332,"dup":39}],331:[function(require,module,exports){
+},{"./cbc":336,"./cfb":337,"./cfb1":338,"./cfb8":339,"./ctr":340,"./ecb":341,"./list.json":343,"./ofb":344,"dup":39}],343:[function(require,module,exports){
 arguments[4][40][0].apply(exports,arguments)
-},{"dup":40}],332:[function(require,module,exports){
+},{"dup":40}],344:[function(require,module,exports){
 arguments[4][41][0].apply(exports,arguments)
-},{"buffer":69,"buffer-xor":363,"dup":41}],333:[function(require,module,exports){
+},{"buffer":69,"buffer-xor":375,"dup":41}],345:[function(require,module,exports){
 arguments[4][42][0].apply(exports,arguments)
-},{"./aes":317,"cipher-base":373,"dup":42,"inherits":506,"safe-buffer":624}],334:[function(require,module,exports){
+},{"./aes":329,"cipher-base":385,"dup":42,"inherits":517,"safe-buffer":603}],346:[function(require,module,exports){
 arguments[4][43][0].apply(exports,arguments)
-},{"browserify-aes/browser":319,"browserify-aes/modes":330,"browserify-des":335,"browserify-des/modes":336,"dup":43,"evp_bytestokey":468}],335:[function(require,module,exports){
+},{"browserify-aes/browser":331,"browserify-aes/modes":342,"browserify-des":347,"browserify-des/modes":348,"dup":43,"evp_bytestokey":479}],347:[function(require,module,exports){
 arguments[4][44][0].apply(exports,arguments)
-},{"cipher-base":373,"des.js":387,"dup":44,"inherits":506,"safe-buffer":624}],336:[function(require,module,exports){
+},{"cipher-base":385,"des.js":399,"dup":44,"inherits":517,"safe-buffer":603}],348:[function(require,module,exports){
 arguments[4][45][0].apply(exports,arguments)
-},{"dup":45}],337:[function(require,module,exports){
+},{"dup":45}],349:[function(require,module,exports){
 arguments[4][46][0].apply(exports,arguments)
-},{"bn.js":338,"buffer":69,"dup":46,"randombytes":611}],338:[function(require,module,exports){
+},{"bn.js":350,"buffer":69,"dup":46,"randombytes":590}],350:[function(require,module,exports){
 arguments[4][23][0].apply(exports,arguments)
-},{"buffer":25,"dup":23}],339:[function(require,module,exports){
+},{"buffer":25,"dup":23}],351:[function(require,module,exports){
 arguments[4][47][0].apply(exports,arguments)
-},{"./browser/algorithms.json":340,"dup":47}],340:[function(require,module,exports){
+},{"./browser/algorithms.json":352,"dup":47}],352:[function(require,module,exports){
 arguments[4][48][0].apply(exports,arguments)
-},{"dup":48}],341:[function(require,module,exports){
+},{"dup":48}],353:[function(require,module,exports){
 arguments[4][49][0].apply(exports,arguments)
-},{"dup":49}],342:[function(require,module,exports){
+},{"dup":49}],354:[function(require,module,exports){
 arguments[4][50][0].apply(exports,arguments)
-},{"./algorithms.json":340,"./sign":343,"./verify":344,"create-hash":381,"dup":50,"inherits":346,"readable-stream":361,"safe-buffer":362}],343:[function(require,module,exports){
+},{"./algorithms.json":352,"./sign":355,"./verify":356,"create-hash":393,"dup":50,"inherits":358,"readable-stream":373,"safe-buffer":374}],355:[function(require,module,exports){
 arguments[4][51][0].apply(exports,arguments)
-},{"./curves.json":341,"bn.js":345,"browserify-rsa":337,"create-hmac":383,"dup":51,"elliptic":398,"parse-asn1":594,"safe-buffer":362}],344:[function(require,module,exports){
+},{"./curves.json":353,"bn.js":357,"browserify-rsa":349,"create-hmac":395,"dup":51,"elliptic":410,"parse-asn1":573,"safe-buffer":374}],356:[function(require,module,exports){
 arguments[4][52][0].apply(exports,arguments)
-},{"./curves.json":341,"bn.js":345,"dup":52,"elliptic":398,"parse-asn1":594,"safe-buffer":362}],345:[function(require,module,exports){
+},{"./curves.json":353,"bn.js":357,"dup":52,"elliptic":410,"parse-asn1":573,"safe-buffer":374}],357:[function(require,module,exports){
 arguments[4][23][0].apply(exports,arguments)
-},{"buffer":25,"dup":23}],346:[function(require,module,exports){
+},{"buffer":25,"dup":23}],358:[function(require,module,exports){
 arguments[4][150][0].apply(exports,arguments)
-},{"dup":150}],347:[function(require,module,exports){
+},{"dup":150}],359:[function(require,module,exports){
 arguments[4][53][0].apply(exports,arguments)
-},{"dup":53}],348:[function(require,module,exports){
+},{"dup":53}],360:[function(require,module,exports){
 arguments[4][54][0].apply(exports,arguments)
-},{"./_stream_readable":350,"./_stream_writable":352,"_process":173,"dup":54,"inherits":346}],349:[function(require,module,exports){
+},{"./_stream_readable":362,"./_stream_writable":364,"_process":173,"dup":54,"inherits":358}],361:[function(require,module,exports){
 arguments[4][55][0].apply(exports,arguments)
-},{"./_stream_transform":351,"dup":55,"inherits":346}],350:[function(require,module,exports){
+},{"./_stream_transform":363,"dup":55,"inherits":358}],362:[function(require,module,exports){
 arguments[4][56][0].apply(exports,arguments)
-},{"../errors":347,"./_stream_duplex":348,"./internal/streams/async_iterator":353,"./internal/streams/buffer_list":354,"./internal/streams/destroy":355,"./internal/streams/from":357,"./internal/streams/state":359,"./internal/streams/stream":360,"_process":173,"buffer":69,"dup":56,"events":110,"inherits":346,"string_decoder/":640,"util":25}],351:[function(require,module,exports){
+},{"../errors":359,"./_stream_duplex":360,"./internal/streams/async_iterator":365,"./internal/streams/buffer_list":366,"./internal/streams/destroy":367,"./internal/streams/from":369,"./internal/streams/state":371,"./internal/streams/stream":372,"_process":173,"buffer":69,"dup":56,"events":110,"inherits":358,"string_decoder/":618,"util":25}],363:[function(require,module,exports){
 arguments[4][57][0].apply(exports,arguments)
-},{"../errors":347,"./_stream_duplex":348,"dup":57,"inherits":346}],352:[function(require,module,exports){
+},{"../errors":359,"./_stream_duplex":360,"dup":57,"inherits":358}],364:[function(require,module,exports){
 arguments[4][58][0].apply(exports,arguments)
-},{"../errors":347,"./_stream_duplex":348,"./internal/streams/destroy":355,"./internal/streams/state":359,"./internal/streams/stream":360,"_process":173,"buffer":69,"dup":58,"inherits":346,"util-deprecate":649}],353:[function(require,module,exports){
+},{"../errors":359,"./_stream_duplex":360,"./internal/streams/destroy":367,"./internal/streams/state":371,"./internal/streams/stream":372,"_process":173,"buffer":69,"dup":58,"inherits":358,"util-deprecate":627}],365:[function(require,module,exports){
 arguments[4][59][0].apply(exports,arguments)
-},{"./end-of-stream":356,"_process":173,"dup":59}],354:[function(require,module,exports){
+},{"./end-of-stream":368,"_process":173,"dup":59}],366:[function(require,module,exports){
 arguments[4][60][0].apply(exports,arguments)
-},{"buffer":69,"dup":60,"util":25}],355:[function(require,module,exports){
+},{"buffer":69,"dup":60,"util":25}],367:[function(require,module,exports){
 arguments[4][61][0].apply(exports,arguments)
-},{"_process":173,"dup":61}],356:[function(require,module,exports){
+},{"_process":173,"dup":61}],368:[function(require,module,exports){
 arguments[4][62][0].apply(exports,arguments)
-},{"../../../errors":347,"dup":62}],357:[function(require,module,exports){
+},{"../../../errors":359,"dup":62}],369:[function(require,module,exports){
 arguments[4][63][0].apply(exports,arguments)
-},{"dup":63}],358:[function(require,module,exports){
+},{"dup":63}],370:[function(require,module,exports){
 arguments[4][64][0].apply(exports,arguments)
-},{"../../../errors":347,"./end-of-stream":356,"dup":64}],359:[function(require,module,exports){
+},{"../../../errors":359,"./end-of-stream":368,"dup":64}],371:[function(require,module,exports){
 arguments[4][65][0].apply(exports,arguments)
-},{"../../../errors":347,"dup":65}],360:[function(require,module,exports){
+},{"../../../errors":359,"dup":65}],372:[function(require,module,exports){
 arguments[4][66][0].apply(exports,arguments)
-},{"dup":66,"events":110}],361:[function(require,module,exports){
+},{"dup":66,"events":110}],373:[function(require,module,exports){
 arguments[4][67][0].apply(exports,arguments)
-},{"./lib/_stream_duplex.js":348,"./lib/_stream_passthrough.js":349,"./lib/_stream_readable.js":350,"./lib/_stream_transform.js":351,"./lib/_stream_writable.js":352,"./lib/internal/streams/end-of-stream.js":356,"./lib/internal/streams/pipeline.js":358,"dup":67}],362:[function(require,module,exports){
+},{"./lib/_stream_duplex.js":360,"./lib/_stream_passthrough.js":361,"./lib/_stream_readable.js":362,"./lib/_stream_transform.js":363,"./lib/_stream_writable.js":364,"./lib/internal/streams/end-of-stream.js":368,"./lib/internal/streams/pipeline.js":370,"dup":67}],374:[function(require,module,exports){
 arguments[4][188][0].apply(exports,arguments)
-},{"buffer":69,"dup":188}],363:[function(require,module,exports){
+},{"buffer":69,"dup":188}],375:[function(require,module,exports){
 arguments[4][68][0].apply(exports,arguments)
-},{"buffer":69,"dup":68}],364:[function(require,module,exports){
+},{"buffer":69,"dup":68}],376:[function(require,module,exports){
 module.exports={
   "identity": 0,
   "ip4": 4,
@@ -38552,7 +39798,7 @@ module.exports={
   "holochain-sig-v0": 10645796,
   "holochain-sig-v1": 10711332
 }
-},{}],365:[function(require,module,exports){
+},{}],377:[function(require,module,exports){
 'use strict'
 
 const table = require('./base-table.json')
@@ -38566,7 +39812,7 @@ for (const [name, code] of Object.entries(table)) {
 
 module.exports = Object.freeze(constants)
 
-},{"./base-table.json":364}],366:[function(require,module,exports){
+},{"./base-table.json":376}],378:[function(require,module,exports){
 /**
  * Implementation of the multicodec specification.
  *
@@ -38695,7 +39941,7 @@ Object.assign(exports, constants)
 // Human friendly names for printing, e.g. in error messages
 exports.print = require('./print')
 
-},{"./constants":365,"./int-table":367,"./print":368,"./util":369,"./varint-table":370,"buffer":69,"varint":652}],367:[function(require,module,exports){
+},{"./constants":377,"./int-table":379,"./print":380,"./util":381,"./varint-table":382,"buffer":69,"varint":630}],379:[function(require,module,exports){
 'use strict'
 const baseTable = require('./base-table.json')
 
@@ -38709,7 +39955,7 @@ for (const encodingName in baseTable) {
 
 module.exports = Object.freeze(nameTable)
 
-},{"./base-table.json":364}],368:[function(require,module,exports){
+},{"./base-table.json":376}],380:[function(require,module,exports){
 'use strict'
 
 const table = require('./base-table.json')
@@ -38723,7 +39969,7 @@ for (const [name, code] of Object.entries(table)) {
 
 module.exports = Object.freeze(tableByCode)
 
-},{"./base-table.json":364}],369:[function(require,module,exports){
+},{"./base-table.json":376}],381:[function(require,module,exports){
 'use strict'
 const varint = require('varint')
 const { Buffer } = require('buffer')
@@ -38760,7 +40006,7 @@ function varintEncode (num) {
   return Buffer.from(varint.encode(num))
 }
 
-},{"buffer":69,"varint":652}],370:[function(require,module,exports){
+},{"buffer":69,"varint":630}],382:[function(require,module,exports){
 'use strict'
 
 const baseTable = require('./base-table.json')
@@ -38776,7 +40022,7 @@ for (const encodingName in baseTable) {
 
 module.exports = Object.freeze(varintTable)
 
-},{"./base-table.json":364,"./util":369}],371:[function(require,module,exports){
+},{"./base-table.json":376,"./util":381}],383:[function(require,module,exports){
 'use strict'
 
 const mh = require('multihashes')
@@ -38830,7 +40076,7 @@ var CIDUtil = {
 
 module.exports = CIDUtil
 
-},{"buffer":69,"multihashes":581}],372:[function(require,module,exports){
+},{"buffer":69,"multihashes":563}],384:[function(require,module,exports){
 'use strict'
 
 const { Buffer } = require('buffer')
@@ -39140,9 +40386,9 @@ _CID.codecs = codecs
 
 module.exports = _CID
 
-},{"./cid-util":371,"buffer":69,"class-is":374,"multibase":566,"multicodec":366,"multicodec/src/base-table.json":364,"multihashes":581}],373:[function(require,module,exports){
+},{"./cid-util":383,"buffer":69,"class-is":386,"multibase":548,"multicodec":378,"multicodec/src/base-table.json":376,"multihashes":563}],385:[function(require,module,exports){
 arguments[4][73][0].apply(exports,arguments)
-},{"dup":73,"inherits":506,"safe-buffer":624,"stream":198,"string_decoder":232}],374:[function(require,module,exports){
+},{"dup":73,"inherits":517,"safe-buffer":603,"stream":198,"string_decoder":232}],386:[function(require,module,exports){
 'use strict';
 
 function withIs(Class, { className, symbolName }) {
@@ -39210,7 +40456,7 @@ function withIsProto(Class, { className, symbolName, withoutNew }) {
 module.exports = withIs;
 module.exports.proto = withIsProto;
 
-},{}],375:[function(require,module,exports){
+},{}],387:[function(require,module,exports){
 /*
 	ISC License
 
@@ -39246,7 +40492,7 @@ const cidV0ToV1Base32 = (ipfsHash) => {
 
 exports.cidV0ToV1Base32 = cidV0ToV1Base32;
 
-},{"cids":372}],376:[function(require,module,exports){
+},{"cids":384}],388:[function(require,module,exports){
 /*
 	ISC License
 
@@ -39332,7 +40578,7 @@ module.exports = {
 	},
 }
 
-},{"./helpers":375,"./profiles":377,"multicodec":569}],377:[function(require,module,exports){
+},{"./helpers":387,"./profiles":389,"multicodec":551}],389:[function(require,module,exports){
 (function (Buffer){(function (){
 /*
 	ISC License
@@ -39455,7 +40701,7 @@ const profiles = {
 exports.hexStringToBuffer = hexStringToBuffer;
 exports.profiles = profiles;
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"buffer":69,"cids":372,"multihashes":581}],378:[function(require,module,exports){
+},{"buffer":69,"cids":384,"multihashes":563}],390:[function(require,module,exports){
 /* jshint node: true */
 (function () {
     "use strict";
@@ -39733,7 +40979,7 @@ exports.profiles = profiles;
     };
 }());
 
-},{}],379:[function(require,module,exports){
+},{}],391:[function(require,module,exports){
 (function (Buffer){(function (){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -39844,19 +41090,19 @@ function objectToString(o) {
 }
 
 }).call(this)}).call(this,{"isBuffer":require("../../../../../.nvm/versions/node/v15.3.0/lib/node_modules/browserify/node_modules/is-buffer/index.js")})
-},{"../../../../../.nvm/versions/node/v15.3.0/lib/node_modules/browserify/node_modules/is-buffer/index.js":152}],380:[function(require,module,exports){
+},{"../../../../../.nvm/versions/node/v15.3.0/lib/node_modules/browserify/node_modules/is-buffer/index.js":152}],392:[function(require,module,exports){
 arguments[4][74][0].apply(exports,arguments)
-},{"bn.js":315,"buffer":69,"dup":74,"elliptic":398}],381:[function(require,module,exports){
+},{"bn.js":327,"buffer":69,"dup":74,"elliptic":410}],393:[function(require,module,exports){
 arguments[4][76][0].apply(exports,arguments)
-},{"cipher-base":373,"dup":76,"inherits":506,"md5.js":557,"ripemd160":622,"sha.js":632}],382:[function(require,module,exports){
+},{"cipher-base":385,"dup":76,"inherits":517,"md5.js":539,"ripemd160":601,"sha.js":610}],394:[function(require,module,exports){
 arguments[4][77][0].apply(exports,arguments)
-},{"dup":77,"md5.js":557}],383:[function(require,module,exports){
+},{"dup":77,"md5.js":539}],395:[function(require,module,exports){
 arguments[4][78][0].apply(exports,arguments)
-},{"./legacy":384,"cipher-base":373,"create-hash/md5":382,"dup":78,"inherits":506,"ripemd160":622,"safe-buffer":624,"sha.js":632}],384:[function(require,module,exports){
+},{"./legacy":396,"cipher-base":385,"create-hash/md5":394,"dup":78,"inherits":517,"ripemd160":601,"safe-buffer":603,"sha.js":610}],396:[function(require,module,exports){
 arguments[4][79][0].apply(exports,arguments)
-},{"cipher-base":373,"dup":79,"inherits":506,"safe-buffer":624}],385:[function(require,module,exports){
+},{"cipher-base":385,"dup":79,"inherits":517,"safe-buffer":603}],397:[function(require,module,exports){
 arguments[4][80][0].apply(exports,arguments)
-},{"browserify-cipher":334,"browserify-sign":342,"browserify-sign/algos":339,"create-ecdh":380,"create-hash":381,"create-hmac":383,"diffie-hellman":394,"dup":80,"pbkdf2":596,"public-encrypt":603,"randombytes":611,"randomfill":612}],386:[function(require,module,exports){
+},{"browserify-cipher":346,"browserify-sign":354,"browserify-sign/algos":351,"create-ecdh":392,"create-hash":393,"create-hmac":395,"diffie-hellman":406,"dup":80,"pbkdf2":575,"public-encrypt":582,"randombytes":590,"randomfill":591}],398:[function(require,module,exports){
 'use strict';
 var token = '%[a-f0-9]{2}';
 var singleMatcher = new RegExp(token, 'gi');
@@ -39952,19 +41198,19 @@ module.exports = function (encodedURI) {
 	}
 };
 
-},{}],387:[function(require,module,exports){
+},{}],399:[function(require,module,exports){
 arguments[4][81][0].apply(exports,arguments)
-},{"./des/cbc":388,"./des/cipher":389,"./des/des":390,"./des/ede":391,"./des/utils":392,"dup":81}],388:[function(require,module,exports){
+},{"./des/cbc":400,"./des/cipher":401,"./des/des":402,"./des/ede":403,"./des/utils":404,"dup":81}],400:[function(require,module,exports){
 arguments[4][82][0].apply(exports,arguments)
-},{"dup":82,"inherits":506,"minimalistic-assert":559}],389:[function(require,module,exports){
+},{"dup":82,"inherits":517,"minimalistic-assert":541}],401:[function(require,module,exports){
 arguments[4][83][0].apply(exports,arguments)
-},{"dup":83,"minimalistic-assert":559}],390:[function(require,module,exports){
+},{"dup":83,"minimalistic-assert":541}],402:[function(require,module,exports){
 arguments[4][84][0].apply(exports,arguments)
-},{"./cipher":389,"./utils":392,"dup":84,"inherits":506,"minimalistic-assert":559}],391:[function(require,module,exports){
+},{"./cipher":401,"./utils":404,"dup":84,"inherits":517,"minimalistic-assert":541}],403:[function(require,module,exports){
 arguments[4][85][0].apply(exports,arguments)
-},{"./cipher":389,"./des":390,"dup":85,"inherits":506,"minimalistic-assert":559}],392:[function(require,module,exports){
+},{"./cipher":401,"./des":402,"dup":85,"inherits":517,"minimalistic-assert":541}],404:[function(require,module,exports){
 arguments[4][86][0].apply(exports,arguments)
-},{"dup":86}],393:[function(require,module,exports){
+},{"dup":86}],405:[function(require,module,exports){
 (function (process){(function (){
 function detect() {
   if (typeof navigator !== 'undefined') {
@@ -40099,47 +41345,47 @@ module.exports = {
 };
 
 }).call(this)}).call(this,require('_process'))
-},{"_process":173}],394:[function(require,module,exports){
+},{"_process":173}],406:[function(require,module,exports){
 arguments[4][87][0].apply(exports,arguments)
-},{"./lib/dh":395,"./lib/generatePrime":396,"./lib/primes.json":397,"buffer":69,"dup":87}],395:[function(require,module,exports){
+},{"./lib/dh":407,"./lib/generatePrime":408,"./lib/primes.json":409,"buffer":69,"dup":87}],407:[function(require,module,exports){
 arguments[4][88][0].apply(exports,arguments)
-},{"./generatePrime":396,"bn.js":315,"buffer":69,"dup":88,"miller-rabin":558,"randombytes":611}],396:[function(require,module,exports){
+},{"./generatePrime":408,"bn.js":327,"buffer":69,"dup":88,"miller-rabin":540,"randombytes":590}],408:[function(require,module,exports){
 arguments[4][89][0].apply(exports,arguments)
-},{"bn.js":315,"dup":89,"miller-rabin":558,"randombytes":611}],397:[function(require,module,exports){
+},{"bn.js":327,"dup":89,"miller-rabin":540,"randombytes":590}],409:[function(require,module,exports){
 arguments[4][90][0].apply(exports,arguments)
-},{"dup":90}],398:[function(require,module,exports){
+},{"dup":90}],410:[function(require,module,exports){
 arguments[4][92][0].apply(exports,arguments)
-},{"../package.json":413,"./elliptic/curve":401,"./elliptic/curves":404,"./elliptic/ec":405,"./elliptic/eddsa":408,"./elliptic/utils":412,"brorand":316,"dup":92}],399:[function(require,module,exports){
+},{"../package.json":425,"./elliptic/curve":413,"./elliptic/curves":416,"./elliptic/ec":417,"./elliptic/eddsa":420,"./elliptic/utils":424,"brorand":328,"dup":92}],411:[function(require,module,exports){
 arguments[4][93][0].apply(exports,arguments)
-},{"../utils":412,"bn.js":315,"dup":93}],400:[function(require,module,exports){
+},{"../utils":424,"bn.js":327,"dup":93}],412:[function(require,module,exports){
 arguments[4][94][0].apply(exports,arguments)
-},{"../utils":412,"./base":399,"bn.js":315,"dup":94,"inherits":506}],401:[function(require,module,exports){
+},{"../utils":424,"./base":411,"bn.js":327,"dup":94,"inherits":517}],413:[function(require,module,exports){
 arguments[4][95][0].apply(exports,arguments)
-},{"./base":399,"./edwards":400,"./mont":402,"./short":403,"dup":95}],402:[function(require,module,exports){
+},{"./base":411,"./edwards":412,"./mont":414,"./short":415,"dup":95}],414:[function(require,module,exports){
 arguments[4][96][0].apply(exports,arguments)
-},{"../utils":412,"./base":399,"bn.js":315,"dup":96,"inherits":506}],403:[function(require,module,exports){
+},{"../utils":424,"./base":411,"bn.js":327,"dup":96,"inherits":517}],415:[function(require,module,exports){
 arguments[4][97][0].apply(exports,arguments)
-},{"../utils":412,"./base":399,"bn.js":315,"dup":97,"inherits":506}],404:[function(require,module,exports){
+},{"../utils":424,"./base":411,"bn.js":327,"dup":97,"inherits":517}],416:[function(require,module,exports){
 arguments[4][98][0].apply(exports,arguments)
-},{"./curve":401,"./precomputed/secp256k1":411,"./utils":412,"dup":98,"hash.js":491}],405:[function(require,module,exports){
+},{"./curve":413,"./precomputed/secp256k1":423,"./utils":424,"dup":98,"hash.js":502}],417:[function(require,module,exports){
 arguments[4][99][0].apply(exports,arguments)
-},{"../curves":404,"../utils":412,"./key":406,"./signature":407,"bn.js":315,"brorand":316,"dup":99,"hmac-drbg":503}],406:[function(require,module,exports){
+},{"../curves":416,"../utils":424,"./key":418,"./signature":419,"bn.js":327,"brorand":328,"dup":99,"hmac-drbg":514}],418:[function(require,module,exports){
 arguments[4][100][0].apply(exports,arguments)
-},{"../utils":412,"bn.js":315,"dup":100}],407:[function(require,module,exports){
+},{"../utils":424,"bn.js":327,"dup":100}],419:[function(require,module,exports){
 arguments[4][101][0].apply(exports,arguments)
-},{"../utils":412,"bn.js":315,"dup":101}],408:[function(require,module,exports){
+},{"../utils":424,"bn.js":327,"dup":101}],420:[function(require,module,exports){
 arguments[4][102][0].apply(exports,arguments)
-},{"../curves":404,"../utils":412,"./key":409,"./signature":410,"dup":102,"hash.js":491}],409:[function(require,module,exports){
+},{"../curves":416,"../utils":424,"./key":421,"./signature":422,"dup":102,"hash.js":502}],421:[function(require,module,exports){
 arguments[4][103][0].apply(exports,arguments)
-},{"../utils":412,"dup":103}],410:[function(require,module,exports){
+},{"../utils":424,"dup":103}],422:[function(require,module,exports){
 arguments[4][104][0].apply(exports,arguments)
-},{"../utils":412,"bn.js":315,"dup":104}],411:[function(require,module,exports){
+},{"../utils":424,"bn.js":327,"dup":104}],423:[function(require,module,exports){
 arguments[4][105][0].apply(exports,arguments)
-},{"dup":105}],412:[function(require,module,exports){
+},{"dup":105}],424:[function(require,module,exports){
 arguments[4][106][0].apply(exports,arguments)
-},{"bn.js":315,"dup":106,"minimalistic-assert":559,"minimalistic-crypto-utils":560}],413:[function(require,module,exports){
+},{"bn.js":327,"dup":106,"minimalistic-assert":541,"minimalistic-crypto-utils":542}],425:[function(require,module,exports){
 arguments[4][108][0].apply(exports,arguments)
-},{"dup":108}],414:[function(require,module,exports){
+},{"dup":108}],426:[function(require,module,exports){
 (function (process){(function (){
 var once = require('once');
 
@@ -40237,7 +41483,7 @@ var eos = function(stream, opts, callback) {
 module.exports = eos;
 
 }).call(this)}).call(this,require('_process'))
-},{"_process":173,"once":589}],415:[function(require,module,exports){
+},{"_process":173,"once":568}],427:[function(require,module,exports){
 var naiveFallback = function () {
 	if (typeof self === "object" && self) return self;
 	if (typeof window === "object" && window) return window;
@@ -40274,7 +41520,7 @@ module.exports = (function () {
 	}
 })();
 
-},{}],416:[function(require,module,exports){
+},{}],428:[function(require,module,exports){
 (function (Buffer){(function (){
 var sha3 = require('js-sha3').keccak_256
 var uts46 = require('idna-uts46-hx')
@@ -40308,7 +41554,7 @@ exports.hash = namehash
 exports.normalize = normalize
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"buffer":69,"idna-uts46-hx":505,"js-sha3":540}],417:[function(require,module,exports){
+},{"buffer":69,"idna-uts46-hx":516,"js-sha3":522}],429:[function(require,module,exports){
 var generate = function generate(num, fn) {
   var a = [];
   for (var i = 0; i < num; ++i) {
@@ -40349,7 +41595,7 @@ module.exports = {
   flatten: flatten,
   chunksOf: chunksOf
 };
-},{}],418:[function(require,module,exports){
+},{}],430:[function(require,module,exports){
 var A = require("./array.js");
 
 var at = function at(bytes, index) {
@@ -40538,7 +41784,7 @@ module.exports = {
   fromUint8Array: fromUint8Array,
   toUint8Array: toUint8Array
 };
-},{"./array.js":417}],419:[function(require,module,exports){
+},{"./array.js":429}],431:[function(require,module,exports){
 // This was ported from https://github.com/emn178/js-sha3, with some minor
 // modifications and pruning. It is licensed under MIT:
 //
@@ -40878,7 +42124,7 @@ module.exports = {
   keccak256s: keccak(256),
   keccak512s: keccak(512)
 };
-},{}],420:[function(require,module,exports){
+},{}],432:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.EthereumProviderError = exports.EthereumRpcError = void 0;
@@ -40955,7 +42201,7 @@ function stringifyReplacer(_, value) {
     return value;
 }
 
-},{"fast-safe-stringify":471}],421:[function(require,module,exports){
+},{"fast-safe-stringify":482}],433:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.errorValues = exports.errorCodes = void 0;
@@ -41048,7 +42294,7 @@ exports.errorValues = {
     },
 };
 
-},{}],422:[function(require,module,exports){
+},{}],434:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ethErrors = void 0;
@@ -41188,7 +42434,7 @@ function parseOpts(arg) {
     return [];
 }
 
-},{"./classes":420,"./error-constants":421,"./utils":424}],423:[function(require,module,exports){
+},{"./classes":432,"./error-constants":433,"./utils":436}],435:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getMessageFromCode = exports.serializeError = exports.EthereumProviderError = exports.EthereumRpcError = exports.ethErrors = exports.errorCodes = void 0;
@@ -41203,7 +42449,7 @@ Object.defineProperty(exports, "ethErrors", { enumerable: true, get: function ()
 const error_constants_1 = require("./error-constants");
 Object.defineProperty(exports, "errorCodes", { enumerable: true, get: function () { return error_constants_1.errorCodes; } });
 
-},{"./classes":420,"./error-constants":421,"./errors":422,"./utils":424}],424:[function(require,module,exports){
+},{"./classes":432,"./error-constants":433,"./errors":434,"./utils":436}],436:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.serializeError = exports.isValidCode = exports.getMessageFromCode = exports.JSON_RPC_SERVER_ERROR_MESSAGE = void 0;
@@ -41315,7 +42561,7 @@ function hasKey(obj, key) {
     return Object.prototype.hasOwnProperty.call(obj, key);
 }
 
-},{"./classes":420,"./error-constants":421}],425:[function(require,module,exports){
+},{"./classes":432,"./error-constants":433}],437:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const utils_1 = require("./utils");
@@ -41473,7 +42719,7 @@ function isAddress(address) {
 }
 exports.isAddress = isAddress;
 
-},{"./utils":426}],426:[function(require,module,exports){
+},{"./utils":438}],438:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const sha3 = require("js-sha3");
@@ -41576,7 +42822,7 @@ function addSlice(array) {
     return array;
 }
 
-},{"js-sha3":427}],427:[function(require,module,exports){
+},{"js-sha3":439}],439:[function(require,module,exports){
 (function (process,global){(function (){
 /**
  * [js-sha3]{@link https://github.com/emn178/js-sha3}
@@ -42236,7 +43482,7 @@ function addSlice(array) {
 })();
 
 }).call(this)}).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"_process":173}],428:[function(require,module,exports){
+},{"_process":173}],440:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -42250,7 +43496,7 @@ function createHashFunction(hashConstructor) {
 exports.createHashFunction = createHashFunction;
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"buffer":69}],429:[function(require,module,exports){
+},{"buffer":69}],441:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 var hash_utils_1 = require("./hash-utils");
@@ -42268,7 +43514,7 @@ exports.keccak512 = hash_utils_1.createHashFunction(function () {
     return createKeccakHash("keccak512");
 });
 
-},{"./hash-utils":428,"keccak":551}],430:[function(require,module,exports){
+},{"./hash-utils":440,"keccak":533}],442:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 var randombytes = require("randombytes");
@@ -42289,7 +43535,7 @@ function getRandomBytesSync(bytes) {
 }
 exports.getRandomBytesSync = getRandomBytesSync;
 
-},{"randombytes":611}],431:[function(require,module,exports){
+},{"randombytes":590}],443:[function(require,module,exports){
 "use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
@@ -42365,7 +43611,7 @@ function createPrivateKeySync() {
 exports.createPrivateKeySync = createPrivateKeySync;
 __export(require("secp256k1"));
 
-},{"./random":430,"secp256k1":628}],432:[function(require,module,exports){
+},{"./random":442,"secp256k1":606}],444:[function(require,module,exports){
 module.exports={
     "name": "goerli",
     "chainId": 5,
@@ -42483,7 +43729,7 @@ module.exports={
     ]
 }
 
-},{}],433:[function(require,module,exports){
+},{}],445:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.chains = void 0;
@@ -42502,7 +43748,7 @@ exports.chains = {
     goerli: require('./goerli.json'),
 };
 
-},{"./goerli.json":432,"./kovan.json":434,"./mainnet.json":435,"./rinkeby.json":436,"./ropsten.json":437}],434:[function(require,module,exports){
+},{"./goerli.json":444,"./kovan.json":446,"./mainnet.json":447,"./rinkeby.json":448,"./ropsten.json":449}],446:[function(require,module,exports){
 module.exports={
     "name": "kovan",
     "chainId": 42,
@@ -42606,7 +43852,7 @@ module.exports={
     ]
 }
 
-},{}],435:[function(require,module,exports){
+},{}],447:[function(require,module,exports){
 module.exports={
     "name": "mainnet",
     "chainId": 1,
@@ -42744,7 +43990,7 @@ module.exports={
     ]
 }
 
-},{}],436:[function(require,module,exports){
+},{}],448:[function(require,module,exports){
 module.exports={
     "name": "rinkeby",
     "chainId": 4,
@@ -42841,7 +44087,7 @@ module.exports={
     ]
 }
 
-},{}],437:[function(require,module,exports){
+},{}],449:[function(require,module,exports){
 module.exports={
     "name": "ropsten",
     "chainId": 3,
@@ -42951,7 +44197,7 @@ module.exports={
     ]
 }
 
-},{}],438:[function(require,module,exports){
+},{}],450:[function(require,module,exports){
 module.exports={
     "name": "byzantium",
     "comment": "Hardfork with new precompiles, instructions and other protocol changes",
@@ -42993,7 +44239,7 @@ module.exports={
     "sharding": {}
 }
 
-},{}],439:[function(require,module,exports){
+},{}],451:[function(require,module,exports){
 module.exports={
     "name": "chainstart",
     "comment": "Start of the Ethereum main chain",
@@ -43198,7 +44444,7 @@ module.exports={
     "sharding": {}
 }
 
-},{}],440:[function(require,module,exports){
+},{}],452:[function(require,module,exports){
 module.exports={
     "name": "constantinople",
     "comment": "Postponed hardfork including EIP-1283 (SSTORE gas metering changes)",
@@ -43248,7 +44494,7 @@ module.exports={
     "sharding": {}
 }
 
-},{}],441:[function(require,module,exports){
+},{}],453:[function(require,module,exports){
 module.exports={
     "name": "dao",
     "comment": "DAO rescue hardfork",
@@ -43264,7 +44510,7 @@ module.exports={
     "sharding": {}
 }
 
-},{}],442:[function(require,module,exports){
+},{}],454:[function(require,module,exports){
 module.exports={
     "name": "homestead",
     "comment": "Homestead hardfork with protocol and network changes",
@@ -43280,7 +44526,7 @@ module.exports={
     "sharding": {}
 }
 
-},{}],443:[function(require,module,exports){
+},{}],455:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.hardforks = void 0;
@@ -43297,7 +44543,7 @@ exports.hardforks = [
     ['muirGlacier', require('./muirGlacier.json')],
 ];
 
-},{"./byzantium.json":438,"./chainstart.json":439,"./constantinople.json":440,"./dao.json":441,"./homestead.json":442,"./istanbul.json":444,"./muirGlacier.json":445,"./petersburg.json":446,"./spuriousDragon.json":447,"./tangerineWhistle.json":448}],444:[function(require,module,exports){
+},{"./byzantium.json":450,"./chainstart.json":451,"./constantinople.json":452,"./dao.json":453,"./homestead.json":454,"./istanbul.json":456,"./muirGlacier.json":457,"./petersburg.json":458,"./spuriousDragon.json":459,"./tangerineWhistle.json":460}],456:[function(require,module,exports){
 module.exports={
     "name": "istanbul",
     "comment": "HF targeted for December 2019 following the Constantinople/Petersburg HF",
@@ -43370,7 +44616,7 @@ module.exports={
     "sharding": {}
 }
 
-},{}],445:[function(require,module,exports){
+},{}],457:[function(require,module,exports){
 module.exports={
     "name": "muirGlacier",
     "comment": "HF to delay the difficulty bomb",
@@ -43386,7 +44632,7 @@ module.exports={
     "sharding": {}
 }
 
-},{}],446:[function(require,module,exports){
+},{}],458:[function(require,module,exports){
 module.exports={
     "name": "petersburg",
     "comment": "Aka constantinopleFix, removes EIP-1283, activate together with or after constantinople",
@@ -43431,7 +44677,7 @@ module.exports={
     "sharding": {}
 }
 
-},{}],447:[function(require,module,exports){
+},{}],459:[function(require,module,exports){
 module.exports={
     "name": "spuriousDragon",
     "comment": "HF with EIPs for simple replay attack protection, EXP cost increase, state trie clearing, contract code size limit",
@@ -43457,7 +44703,7 @@ module.exports={
     "sharding": {}
 }
 
-},{}],448:[function(require,module,exports){
+},{}],460:[function(require,module,exports){
 module.exports={
     "name": "tangerineWhistle",
     "comment": "Hardfork with gas cost changes for IO-heavy operations",
@@ -43482,7 +44728,7 @@ module.exports={
     "sharding": {}
 }
 
-},{}],449:[function(require,module,exports){
+},{}],461:[function(require,module,exports){
 "use strict";
 var __assign = (this && this.__assign) || function () {
     __assign = Object.assign || function(t) {
@@ -43889,7 +45135,7 @@ var Common = /** @class */ (function () {
 }());
 exports.default = Common;
 
-},{"./chains":433,"./hardforks":443}],450:[function(require,module,exports){
+},{"./chains":445,"./hardforks":455}],462:[function(require,module,exports){
 "use strict";
 var __extends = (this && this.__extends) || (function () {
     var extendStatics = function (d, b) {
@@ -43960,7 +45206,7 @@ var FakeTransaction = /** @class */ (function (_super) {
 }(transaction_1.default));
 exports.default = FakeTransaction;
 
-},{"./transaction":452,"buffer":69,"ethereumjs-util":457}],451:[function(require,module,exports){
+},{"./transaction":464,"buffer":69,"ethereumjs-util":469}],463:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 var transaction_1 = require("./transaction");
@@ -43968,7 +45214,7 @@ exports.Transaction = transaction_1.default;
 var fake_1 = require("./fake");
 exports.FakeTransaction = fake_1.default;
 
-},{"./fake":450,"./transaction":452}],452:[function(require,module,exports){
+},{"./fake":462,"./transaction":464}],464:[function(require,module,exports){
 "use strict";
 var __assign = (this && this.__assign) || function () {
     __assign = Object.assign || function(t) {
@@ -44313,7 +45559,7 @@ var Transaction = /** @class */ (function () {
 }());
 exports.default = Transaction;
 
-},{"buffer":69,"ethereumjs-common":449,"ethereumjs-util":457}],453:[function(require,module,exports){
+},{"buffer":69,"ethereumjs-common":461,"ethereumjs-util":469}],465:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -44484,7 +45730,7 @@ exports.importPublic = function (publicKey) {
 };
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"./bytes":454,"./hash":456,"./secp256k1v3-adapter":459,"assert":17,"bn.js":315,"buffer":69,"ethjs-util":465}],454:[function(require,module,exports){
+},{"./bytes":466,"./hash":468,"./secp256k1v3-adapter":471,"assert":17,"bn.js":327,"buffer":69,"ethjs-util":477}],466:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -44645,7 +45891,7 @@ exports.baToJSON = function (ba) {
 };
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"bn.js":315,"buffer":69,"ethjs-util":465}],455:[function(require,module,exports){
+},{"bn.js":327,"buffer":69,"ethjs-util":477}],467:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -44685,7 +45931,7 @@ exports.KECCAK256_RLP_S = '56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622
 exports.KECCAK256_RLP = Buffer.from(exports.KECCAK256_RLP_S, 'hex');
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"bn.js":315,"buffer":69}],456:[function(require,module,exports){
+},{"bn.js":327,"buffer":69}],468:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -44772,7 +46018,7 @@ exports.rlphash = function (a) {
 };
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"./bytes":454,"buffer":69,"create-hash":381,"ethereum-cryptography/keccak":429,"ethjs-util":465,"rlp":623}],457:[function(require,module,exports){
+},{"./bytes":466,"buffer":69,"create-hash":393,"ethereum-cryptography/keccak":441,"ethjs-util":477,"rlp":602}],469:[function(require,module,exports){
 "use strict";
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -44819,7 +46065,7 @@ __exportStar(require("./bytes"), exports);
  */
 __exportStar(require("./object"), exports);
 
-},{"./account":453,"./bytes":454,"./constants":455,"./hash":456,"./object":458,"./secp256k1v3-adapter":459,"./signature":462,"bn.js":315,"ethjs-util":465,"rlp":623}],458:[function(require,module,exports){
+},{"./account":465,"./bytes":466,"./constants":467,"./hash":468,"./object":470,"./secp256k1v3-adapter":471,"./signature":474,"bn.js":327,"ethjs-util":477,"rlp":602}],470:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -44928,7 +46174,7 @@ exports.defineProperties = function (self, fields, data) {
 };
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"./bytes":454,"assert":17,"buffer":69,"ethjs-util":465,"rlp":623}],459:[function(require,module,exports){
+},{"./bytes":466,"assert":17,"buffer":69,"ethjs-util":477,"rlp":602}],471:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -45231,7 +46477,7 @@ exports.ecdhUnsafe = function (publicKey, privateKey, compressed) {
 };
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"./secp256k1v3-lib/der":460,"./secp256k1v3-lib/index":461,"buffer":69,"ethereum-cryptography/secp256k1":431}],460:[function(require,module,exports){
+},{"./secp256k1v3-lib/der":472,"./secp256k1v3-lib/index":473,"buffer":69,"ethereum-cryptography/secp256k1":443}],472:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 // This file is imported from secp256k1 v3
@@ -45868,7 +47114,7 @@ exports.signatureImportLax = function (signature) {
 };
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"buffer":69}],461:[function(require,module,exports){
+},{"buffer":69}],473:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 // This file is imported from secp256k1 v3
@@ -45932,7 +47178,7 @@ var toPublicKey = function (x, y, compressed) {
 };
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"bn.js":315,"buffer":69,"elliptic":398}],462:[function(require,module,exports){
+},{"bn.js":327,"buffer":69,"elliptic":410}],474:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -46042,7 +47288,7 @@ function isValidSigRecovery(recovery) {
 }
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"./bytes":454,"./hash":456,"./secp256k1v3-adapter":459,"bn.js":315,"buffer":69}],463:[function(require,module,exports){
+},{"./bytes":466,"./hash":468,"./secp256k1v3-adapter":471,"bn.js":327,"buffer":69}],475:[function(require,module,exports){
 'use strict';
 
 var BN = require('bn.js');
@@ -46211,7 +47457,7 @@ module.exports = {
   fromWei: fromWei,
   toWei: toWei
 };
-},{"bn.js":464,"number-to-bn":583}],464:[function(require,module,exports){
+},{"bn.js":476,"number-to-bn":565}],476:[function(require,module,exports){
 (function (module, exports) {
   'use strict';
 
@@ -49640,7 +50886,7 @@ module.exports = {
   };
 })(typeof module === 'undefined' || module, this);
 
-},{}],465:[function(require,module,exports){
+},{}],477:[function(require,module,exports){
 (function (Buffer){(function (){
 'use strict';
 
@@ -49863,7 +51109,7 @@ module.exports = {
   isHexString: isHexString
 };
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"buffer":69,"is-hex-prefixed":537,"strip-hex-prefix":641}],466:[function(require,module,exports){
+},{"buffer":69,"is-hex-prefixed":519,"strip-hex-prefix":619}],478:[function(require,module,exports){
 'use strict';
 
 var has = Object.prototype.hasOwnProperty
@@ -50201,11 +51447,9 @@ if ('undefined' !== typeof module) {
   module.exports = EventEmitter;
 }
 
-},{}],467:[function(require,module,exports){
-arguments[4][110][0].apply(exports,arguments)
-},{"dup":110}],468:[function(require,module,exports){
+},{}],479:[function(require,module,exports){
 arguments[4][111][0].apply(exports,arguments)
-},{"dup":111,"md5.js":557,"safe-buffer":624}],469:[function(require,module,exports){
+},{"dup":111,"md5.js":539,"safe-buffer":603}],480:[function(require,module,exports){
 (function (Buffer){(function (){
 const Duplex = require('readable-stream').Duplex
 const inherits = require('util').inherits
@@ -50288,7 +51532,7 @@ PortDuplexStream.prototype._write = function (msg, encoding, cb) {
   cb()
 }
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"buffer":69,"readable-stream":621,"util":239}],470:[function(require,module,exports){
+},{"buffer":69,"readable-stream":600,"util":239}],481:[function(require,module,exports){
 'use strict';
 
 var isArray = Array.isArray;
@@ -50345,7 +51589,7 @@ module.exports = function equal(a, b) {
   return a!==a && b!==b;
 };
 
-},{}],471:[function(require,module,exports){
+},{}],482:[function(require,module,exports){
 module.exports = stringify
 stringify.default = stringify
 stringify.stable = deterministicStringify
@@ -50508,7 +51752,7 @@ function replaceGetterValues (replacer) {
   }
 }
 
-},{}],472:[function(require,module,exports){
+},{}],483:[function(require,module,exports){
 (function (global){(function (){
 var win;
 
@@ -50525,69 +51769,69 @@ if (typeof window !== "undefined") {
 module.exports = win;
 
 }).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],473:[function(require,module,exports){
+},{}],484:[function(require,module,exports){
 arguments[4][119][0].apply(exports,arguments)
-},{"dup":119,"inherits":474,"readable-stream":489,"safe-buffer":490}],474:[function(require,module,exports){
+},{"dup":119,"inherits":485,"readable-stream":500,"safe-buffer":501}],485:[function(require,module,exports){
 arguments[4][150][0].apply(exports,arguments)
-},{"dup":150}],475:[function(require,module,exports){
+},{"dup":150}],486:[function(require,module,exports){
 arguments[4][53][0].apply(exports,arguments)
-},{"dup":53}],476:[function(require,module,exports){
+},{"dup":53}],487:[function(require,module,exports){
 arguments[4][54][0].apply(exports,arguments)
-},{"./_stream_readable":478,"./_stream_writable":480,"_process":173,"dup":54,"inherits":474}],477:[function(require,module,exports){
+},{"./_stream_readable":489,"./_stream_writable":491,"_process":173,"dup":54,"inherits":485}],488:[function(require,module,exports){
 arguments[4][55][0].apply(exports,arguments)
-},{"./_stream_transform":479,"dup":55,"inherits":474}],478:[function(require,module,exports){
+},{"./_stream_transform":490,"dup":55,"inherits":485}],489:[function(require,module,exports){
 arguments[4][56][0].apply(exports,arguments)
-},{"../errors":475,"./_stream_duplex":476,"./internal/streams/async_iterator":481,"./internal/streams/buffer_list":482,"./internal/streams/destroy":483,"./internal/streams/from":485,"./internal/streams/state":487,"./internal/streams/stream":488,"_process":173,"buffer":69,"dup":56,"events":110,"inherits":474,"string_decoder/":640,"util":25}],479:[function(require,module,exports){
+},{"../errors":486,"./_stream_duplex":487,"./internal/streams/async_iterator":492,"./internal/streams/buffer_list":493,"./internal/streams/destroy":494,"./internal/streams/from":496,"./internal/streams/state":498,"./internal/streams/stream":499,"_process":173,"buffer":69,"dup":56,"events":110,"inherits":485,"string_decoder/":618,"util":25}],490:[function(require,module,exports){
 arguments[4][57][0].apply(exports,arguments)
-},{"../errors":475,"./_stream_duplex":476,"dup":57,"inherits":474}],480:[function(require,module,exports){
+},{"../errors":486,"./_stream_duplex":487,"dup":57,"inherits":485}],491:[function(require,module,exports){
 arguments[4][58][0].apply(exports,arguments)
-},{"../errors":475,"./_stream_duplex":476,"./internal/streams/destroy":483,"./internal/streams/state":487,"./internal/streams/stream":488,"_process":173,"buffer":69,"dup":58,"inherits":474,"util-deprecate":649}],481:[function(require,module,exports){
+},{"../errors":486,"./_stream_duplex":487,"./internal/streams/destroy":494,"./internal/streams/state":498,"./internal/streams/stream":499,"_process":173,"buffer":69,"dup":58,"inherits":485,"util-deprecate":627}],492:[function(require,module,exports){
 arguments[4][59][0].apply(exports,arguments)
-},{"./end-of-stream":484,"_process":173,"dup":59}],482:[function(require,module,exports){
+},{"./end-of-stream":495,"_process":173,"dup":59}],493:[function(require,module,exports){
 arguments[4][60][0].apply(exports,arguments)
-},{"buffer":69,"dup":60,"util":25}],483:[function(require,module,exports){
+},{"buffer":69,"dup":60,"util":25}],494:[function(require,module,exports){
 arguments[4][61][0].apply(exports,arguments)
-},{"_process":173,"dup":61}],484:[function(require,module,exports){
+},{"_process":173,"dup":61}],495:[function(require,module,exports){
 arguments[4][62][0].apply(exports,arguments)
-},{"../../../errors":475,"dup":62}],485:[function(require,module,exports){
+},{"../../../errors":486,"dup":62}],496:[function(require,module,exports){
 arguments[4][63][0].apply(exports,arguments)
-},{"dup":63}],486:[function(require,module,exports){
+},{"dup":63}],497:[function(require,module,exports){
 arguments[4][64][0].apply(exports,arguments)
-},{"../../../errors":475,"./end-of-stream":484,"dup":64}],487:[function(require,module,exports){
+},{"../../../errors":486,"./end-of-stream":495,"dup":64}],498:[function(require,module,exports){
 arguments[4][65][0].apply(exports,arguments)
-},{"../../../errors":475,"dup":65}],488:[function(require,module,exports){
+},{"../../../errors":486,"dup":65}],499:[function(require,module,exports){
 arguments[4][66][0].apply(exports,arguments)
-},{"dup":66,"events":110}],489:[function(require,module,exports){
+},{"dup":66,"events":110}],500:[function(require,module,exports){
 arguments[4][67][0].apply(exports,arguments)
-},{"./lib/_stream_duplex.js":476,"./lib/_stream_passthrough.js":477,"./lib/_stream_readable.js":478,"./lib/_stream_transform.js":479,"./lib/_stream_writable.js":480,"./lib/internal/streams/end-of-stream.js":484,"./lib/internal/streams/pipeline.js":486,"dup":67}],490:[function(require,module,exports){
+},{"./lib/_stream_duplex.js":487,"./lib/_stream_passthrough.js":488,"./lib/_stream_readable.js":489,"./lib/_stream_transform.js":490,"./lib/_stream_writable.js":491,"./lib/internal/streams/end-of-stream.js":495,"./lib/internal/streams/pipeline.js":497,"dup":67}],501:[function(require,module,exports){
 arguments[4][188][0].apply(exports,arguments)
-},{"buffer":69,"dup":188}],491:[function(require,module,exports){
+},{"buffer":69,"dup":188}],502:[function(require,module,exports){
 arguments[4][135][0].apply(exports,arguments)
-},{"./hash/common":492,"./hash/hmac":493,"./hash/ripemd":494,"./hash/sha":495,"./hash/utils":502,"dup":135}],492:[function(require,module,exports){
+},{"./hash/common":503,"./hash/hmac":504,"./hash/ripemd":505,"./hash/sha":506,"./hash/utils":513,"dup":135}],503:[function(require,module,exports){
 arguments[4][136][0].apply(exports,arguments)
-},{"./utils":502,"dup":136,"minimalistic-assert":559}],493:[function(require,module,exports){
+},{"./utils":513,"dup":136,"minimalistic-assert":541}],504:[function(require,module,exports){
 arguments[4][137][0].apply(exports,arguments)
-},{"./utils":502,"dup":137,"minimalistic-assert":559}],494:[function(require,module,exports){
+},{"./utils":513,"dup":137,"minimalistic-assert":541}],505:[function(require,module,exports){
 arguments[4][138][0].apply(exports,arguments)
-},{"./common":492,"./utils":502,"dup":138}],495:[function(require,module,exports){
+},{"./common":503,"./utils":513,"dup":138}],506:[function(require,module,exports){
 arguments[4][139][0].apply(exports,arguments)
-},{"./sha/1":496,"./sha/224":497,"./sha/256":498,"./sha/384":499,"./sha/512":500,"dup":139}],496:[function(require,module,exports){
+},{"./sha/1":507,"./sha/224":508,"./sha/256":509,"./sha/384":510,"./sha/512":511,"dup":139}],507:[function(require,module,exports){
 arguments[4][140][0].apply(exports,arguments)
-},{"../common":492,"../utils":502,"./common":501,"dup":140}],497:[function(require,module,exports){
+},{"../common":503,"../utils":513,"./common":512,"dup":140}],508:[function(require,module,exports){
 arguments[4][141][0].apply(exports,arguments)
-},{"../utils":502,"./256":498,"dup":141}],498:[function(require,module,exports){
+},{"../utils":513,"./256":509,"dup":141}],509:[function(require,module,exports){
 arguments[4][142][0].apply(exports,arguments)
-},{"../common":492,"../utils":502,"./common":501,"dup":142,"minimalistic-assert":559}],499:[function(require,module,exports){
+},{"../common":503,"../utils":513,"./common":512,"dup":142,"minimalistic-assert":541}],510:[function(require,module,exports){
 arguments[4][143][0].apply(exports,arguments)
-},{"../utils":502,"./512":500,"dup":143}],500:[function(require,module,exports){
+},{"../utils":513,"./512":511,"dup":143}],511:[function(require,module,exports){
 arguments[4][144][0].apply(exports,arguments)
-},{"../common":492,"../utils":502,"dup":144,"minimalistic-assert":559}],501:[function(require,module,exports){
+},{"../common":503,"../utils":513,"dup":144,"minimalistic-assert":541}],512:[function(require,module,exports){
 arguments[4][145][0].apply(exports,arguments)
-},{"../utils":502,"dup":145}],502:[function(require,module,exports){
+},{"../utils":513,"dup":145}],513:[function(require,module,exports){
 arguments[4][146][0].apply(exports,arguments)
-},{"dup":146,"inherits":506,"minimalistic-assert":559}],503:[function(require,module,exports){
+},{"dup":146,"inherits":517,"minimalistic-assert":541}],514:[function(require,module,exports){
 arguments[4][147][0].apply(exports,arguments)
-},{"dup":147,"hash.js":491,"minimalistic-assert":559,"minimalistic-crypto-utils":560}],504:[function(require,module,exports){
+},{"dup":147,"hash.js":502,"minimalistic-assert":541,"minimalistic-crypto-utils":542}],515:[function(require,module,exports){
 /* This file is generated from the Unicode IDNA table, using
    the build-unicode-tables.py script. Please edit that
    script instead of this file. */
@@ -51346,7 +52590,7 @@ return {
 };
 }));
 
-},{}],505:[function(require,module,exports){
+},{}],516:[function(require,module,exports){
 (function(root, factory) {
   /* istanbul ignore next */
   if (typeof define === 'function' && define.amd) {
@@ -51480,3043 +52724,9 @@ return {
   };
 }));
 
-},{"./idna-map":504,"punycode":181}],506:[function(require,module,exports){
+},{"./idna-map":515,"punycode":181}],517:[function(require,module,exports){
 arguments[4][18][0].apply(exports,arguments)
-},{"dup":18}],507:[function(require,module,exports){
-const MetaMaskInpageProvider = require('./src/MetaMaskInpageProvider')
-const { initProvider, setGlobalProvider } = require('./src/initProvider')
-
-module.exports = {
-  MetaMaskInpageProvider,
-  initProvider,
-  setGlobalProvider,
-}
-
-},{"./src/MetaMaskInpageProvider":524,"./src/initProvider":525}],508:[function(require,module,exports){
-
-const { EthereumRpcError, EthereumProviderError } = require('./src/classes')
-const {
-  serializeError, getMessageFromCode,
-} = require('./src/utils')
-const ethErrors = require('./src/errors')
-const ERROR_CODES = require('./src/errorCodes.json')
-
-module.exports = {
-  ethErrors,
-  EthereumRpcError,
-  EthereumProviderError,
-  serializeError,
-  getMessageFromCode,
-
-  /** @type ErrorCodes */
-  ERROR_CODES,
-}
-
-// Types
-
-/**
- * @typedef {Object} EthereumProviderErrorCodes
- * @property {number} userRejectedRequest
- * @property {number} unauthorized
- * @property {number} unsupportedMethod
- * @property {number} disconnected
- * @property {number} chainDisconnected
- */
-
-/**
- * @typedef {Object} EthereumRpcErrorCodes
- * @property {number} parse
- * @property {number} invalidRequest
- * @property {number} invalidParams
- * @property {number} methodNotFound
- * @property {number} limitExceeded
- * @property {number} internal
- * @property {number} invalidInput
- * @property {number} resourceNotFound
- * @property {number} resourceUnavailable
- * @property {number} transactionRejected
- * @property {number} methodNotSupported
- */
-
-/**
- * @typedef ErrorCodes
- * @property {EthereumRpcErrorCodes} rpc
- * @property {EthereumProviderErrorCodes} provider
- */
-
-},{"./src/classes":509,"./src/errorCodes.json":510,"./src/errors":512,"./src/utils":513}],509:[function(require,module,exports){
-
-const safeStringify = require('fast-safe-stringify')
-
-/**
- * @class JsonRpcError
- * Error subclass implementing JSON RPC 2.0 errors and Ethereum RPC errors
- * per EIP 1474.
- * Permits any integer error code.
- */
-class EthereumRpcError extends Error {
-
-  /**
-   * Create an Ethereum JSON RPC error.
-   *
-   * @param {number} code - The integer error code.
-   * @param {string} message - The string message.
-   * @param {any} [data] - The error data.
-   */
-  constructor (code, message, data) {
-
-    if (!Number.isInteger(code)) {
-      throw new Error(
-        '"code" must be an integer.',
-      )
-    }
-    if (!message || typeof message !== 'string') {
-      throw new Error(
-        '"message" must be a nonempty string.',
-      )
-    }
-
-    super(message)
-    this.code = code
-    if (data !== undefined) {
-      this.data = data
-    }
-  }
-
-  /**
-   * Returns a plain object with all public class properties.
-   *
-   * @returns {object} The serialized error.
-   */
-  serialize () {
-    const serialized = {
-      code: this.code,
-      message: this.message,
-    }
-    if (this.data !== undefined) {
-      serialized.data = this.data
-    }
-    if (this.stack) {
-      serialized.stack = this.stack
-    }
-    return serialized
-  }
-
-  /**
-   * Return a string representation of the serialized error, omitting
-   * any circular references.
-   *
-   * @returns {string} The serialized error as a string.
-   */
-  toString () {
-    return safeStringify(
-      this.serialize(),
-      stringifyReplacer,
-      2,
-    )
-  }
-}
-
-/**
- * @class EthereumRpcError
- * Error subclass implementing Ethereum Provider errors per EIP 1193.
- * Permits integer error codes in the [ 1000 <= 4999 ] range.
- */
-class EthereumProviderError extends EthereumRpcError {
-
-  /**
-   * Create an Ethereum JSON RPC error.
-   *
-   * @param {number} code - The integer error code, in the [ 1000 <= 4999 ] range.
-   * @param {string} message - The string message.
-   * @param {any} [data] - The error data.
-   */
-  constructor (code, message, data) {
-
-    if (!isValidEthProviderCode(code)) {
-      throw new Error(
-        '"code" must be an integer such that: 1000 <= code <= 4999',
-      )
-    }
-
-    super(code, message, data)
-  }
-}
-
-// Internal
-
-function isValidEthProviderCode (code) {
-  return Number.isInteger(code) && code >= 1000 && code <= 4999
-}
-
-function stringifyReplacer (_, value) {
-  if (value === '[Circular]') {
-    return undefined
-  }
-  return value
-}
-
-// Exports
-
-module.exports = {
-  EthereumRpcError,
-  EthereumProviderError,
-}
-
-},{"fast-safe-stringify":471}],510:[function(require,module,exports){
-module.exports={
-  "rpc": {
-    "invalidInput": -32000,
-    "resourceNotFound": -32001,
-    "resourceUnavailable": -32002,
-    "transactionRejected": -32003,
-    "methodNotSupported": -32004,
-    "limitExceeded": -32005,
-    "parse": -32700,
-    "invalidRequest": -32600,
-    "methodNotFound": -32601,
-    "invalidParams": -32602,
-    "internal": -32603
-  },
-  "provider": {
-    "userRejectedRequest": 4001,
-    "unauthorized": 4100,
-    "unsupportedMethod": 4200,
-    "disconnected": 4900,
-    "chainDisconnected": 4901
-  }
-}
-
-},{}],511:[function(require,module,exports){
-module.exports={
-  "-32700": {
-    "standard": "JSON RPC 2.0",
-    "message": "Invalid JSON was received by the server. An error occurred on the server while parsing the JSON text."
-  },
-  "-32600": {
-    "standard": "JSON RPC 2.0",
-    "message": "The JSON sent is not a valid Request object."
-  },
-  "-32601": {
-    "standard": "JSON RPC 2.0",
-    "message": "The method does not exist / is not available."
-  },
-  "-32602": {
-    "standard": "JSON RPC 2.0",
-    "message": "Invalid method parameter(s)."
-  },
-  "-32603": {
-    "standard": "JSON RPC 2.0",
-    "message": "Internal JSON-RPC error."
-  },
-  "-32000": {
-    "standard": "EIP 1474",
-    "message": "Invalid input."
-  },
-  "-32001": {
-    "standard": "EIP 1474",
-    "message": "Resource not found."
-  },
-  "-32002": {
-    "standard": "EIP 1474",
-    "message": "Resource unavailable."
-  },
-  "-32003": {
-    "standard": "EIP 1474",
-    "message": "Transaction rejected."
-  },
-  "-32004": {
-    "standard": "EIP 1474",
-    "message": "Method not supported."
-  },
-  "-32005": {
-    "standard": "EIP 1474",
-    "message": "Request limit exceeded."
-  },
-  "4001": {
-    "standard": "EIP 1193",
-    "message": "User rejected the request."
-  },
-  "4100": {
-    "standard": "EIP 1193",
-    "message": "The requested account and/or method has not been authorized by the user."
-  },
-  "4200": {
-    "standard": "EIP 1193",
-    "message": "The requested method is not supported by this Ethereum provider."
-  },
-  "4900": {
-    "standard": "EIP 1193",
-    "message": "The provider is disconnected from all chains."
-  },
-  "4901": {
-    "standard": "EIP 1193",
-    "message": "The provider is disconnected from the specified chain."
-  }
-}
-
-},{}],512:[function(require,module,exports){
-
-const { EthereumRpcError, EthereumProviderError } = require('./classes')
-const { getMessageFromCode } = require('./utils')
-const ERROR_CODES = require('./errorCodes.json')
-
-module.exports = {
-  rpc: {
-
-    /**
-     * Get a JSON RPC 2.0 Parse (-32700) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    parse: (opts) => getEthJsonRpcError(
-      ERROR_CODES.rpc.parse, opts,
-    ),
-
-    /**
-     * Get a JSON RPC 2.0 Invalid Request (-32600) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    invalidRequest: (opts) => getEthJsonRpcError(
-      ERROR_CODES.rpc.invalidRequest, opts,
-    ),
-
-    /**
-     * Get a JSON RPC 2.0 Invalid Params (-32602) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    invalidParams: (opts) => getEthJsonRpcError(
-      ERROR_CODES.rpc.invalidParams, opts,
-    ),
-
-    /**
-     * Get a JSON RPC 2.0 Method Not Found (-32601) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    methodNotFound: (opts) => getEthJsonRpcError(
-      ERROR_CODES.rpc.methodNotFound, opts,
-    ),
-
-    /**
-     * Get a JSON RPC 2.0 Internal (-32603) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    internal: (opts) => getEthJsonRpcError(
-      ERROR_CODES.rpc.internal, opts,
-    ),
-
-    /**
-     * Get a JSON RPC 2.0 Server error.
-     * Permits integer error codes in the [ -32099 <= -32005 ] range.
-     * Codes -32000 through -32004 are reserved by EIP 1474.
-     *
-     * @param {Object|string} opts - Options object
-     * @param {number} opts.code - The error code
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    server: (opts) => {
-      if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
-        throw new Error('Ethereum RPC Server errors must provide single object argument.')
-      }
-      const { code } = opts
-      if (!Number.isInteger(code) || code > -32005 || code < -32099) {
-        throw new Error(
-          '"code" must be an integer such that: -32099 <= code <= -32005',
-        )
-      }
-      return getEthJsonRpcError(code, opts)
-    },
-
-    /**
-     * Get an Ethereum JSON RPC Invalid Input (-32000) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    invalidInput: (opts) => getEthJsonRpcError(
-      ERROR_CODES.rpc.invalidInput, opts,
-    ),
-
-    /**
-     * Get an Ethereum JSON RPC Resource Not Found (-32001) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    resourceNotFound: (opts) => getEthJsonRpcError(
-      ERROR_CODES.rpc.resourceNotFound, opts,
-    ),
-
-    /**
-     * Get an Ethereum JSON RPC Resource Unavailable (-32002) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    resourceUnavailable: (opts) => getEthJsonRpcError(
-      ERROR_CODES.rpc.resourceUnavailable, opts,
-    ),
-
-    /**
-     * Get an Ethereum JSON RPC Transaction Rejected (-32003) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    transactionRejected: (opts) => getEthJsonRpcError(
-      ERROR_CODES.rpc.transactionRejected, opts,
-    ),
-
-    /**
-     * Get an Ethereum JSON RPC Method Not Supported (-32004) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    methodNotSupported: (opts) => getEthJsonRpcError(
-      ERROR_CODES.rpc.methodNotSupported, opts,
-    ),
-
-    /**
-     * Get an Ethereum JSON RPC Limit Exceeded (-32005) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumRpcError} The error
-     */
-    limitExceeded: (opts) => getEthJsonRpcError(
-      ERROR_CODES.rpc.limitExceeded, opts,
-    ),
-  },
-
-  provider: {
-
-    /**
-     * Get an Ethereum Provider User Rejected Request (4001) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumProviderError} The error
-     */
-    userRejectedRequest: (opts) => {
-      return getEthProviderError(
-        ERROR_CODES.provider.userRejectedRequest, opts,
-      )
-    },
-
-    /**
-     * Get an Ethereum Provider Unauthorized (4100) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumProviderError} The error
-     */
-    unauthorized: (opts) => {
-      return getEthProviderError(
-        ERROR_CODES.provider.unauthorized, opts,
-      )
-    },
-
-    /**
-     * Get an Ethereum Provider Unsupported Method (4200) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumProviderError} The error
-     */
-    unsupportedMethod: (opts) => {
-      return getEthProviderError(
-        ERROR_CODES.provider.unsupportedMethod, opts,
-      )
-    },
-
-    /**
-     * Get an Ethereum Provider Not Connected (4900) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumProviderError} The error
-     */
-    disconnected: (opts) => {
-      return getEthProviderError(
-        ERROR_CODES.provider.disconnected, opts,
-      )
-    },
-
-    /**
-     * Get an Ethereum Provider Chain Not Connected (4901) error.
-     *
-     * @param {Object|string} [opts] - Options object or error message string
-     * @param {string} [opts.message] - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumProviderError} The error
-     */
-    chainDisconnected: (opts) => {
-      return getEthProviderError(
-        ERROR_CODES.provider.chainDisconnected, opts,
-      )
-    },
-
-    /**
-     * Get a custom Ethereum Provider error.
-     *
-     * @param {Object|string} opts - Options object
-     * @param {number} opts.code - The error code
-     * @param {string} opts.message - The error message
-     * @param {any} [opts.data] - Error data
-     * @returns {EthereumProviderError} The error
-     */
-    custom: (opts) => {
-      if (!opts || typeof opts !== 'object' || Array.isArray(opts)) {
-        throw new Error('Ethereum Provider custom errors must provide single object argument.')
-      }
-      const { code, message, data } = opts
-      if (!message || typeof message !== 'string') {
-        throw new Error(
-          '"message" must be a nonempty string',
-        )
-      }
-      return new EthereumProviderError(code, message, data)
-    },
-  },
-}
-
-// Internal
-
-function getEthJsonRpcError (code, opts) {
-  const [message, data] = validateOpts(opts)
-  return new EthereumRpcError(
-    code,
-    message || getMessageFromCode(code),
-    data,
-  )
-}
-
-function getEthProviderError (code, opts) {
-  const [message, data] = validateOpts(opts)
-  return new EthereumProviderError(
-    code,
-    message || getMessageFromCode(code),
-    data,
-  )
-}
-
-function validateOpts (opts) {
-  if (opts) {
-    if (typeof opts === 'string') {
-      return [opts]
-    } else if (typeof opts === 'object' && !Array.isArray(opts)) {
-      const { message, data } = opts
-      return [message, data]
-    }
-  }
-  return []
-}
-
-},{"./classes":509,"./errorCodes.json":510,"./utils":513}],513:[function(require,module,exports){
-
-const errorValues = require('./errorValues.json')
-const FALLBACK_ERROR_CODE = require('./errorCodes.json').rpc.internal
-const { EthereumRpcError } = require('./classes')
-
-const JSON_RPC_SERVER_ERROR_MESSAGE = 'Unspecified server error.'
-
-const FALLBACK_MESSAGE = 'Unspecified error message. This is a bug, please report it.'
-
-const FALLBACK_ERROR = {
-  code: FALLBACK_ERROR_CODE,
-  message: getMessageFromCode(FALLBACK_ERROR_CODE),
-}
-
-/**
- * Gets the message for a given code, or a fallback message if the code has
- * no corresponding message.
- *
- * @param {number} code - The integer error code
- * @param {string} fallbackMessage - The fallback message
- * @return {string} The corresponding message or the fallback message
- */
-function getMessageFromCode (code, fallbackMessage = FALLBACK_MESSAGE) {
-
-  if (Number.isInteger(code)) {
-
-    const codeString = code.toString()
-
-    if (errorValues[codeString]) {
-      return errorValues[codeString].message
-    }
-    if (isJsonRpcServerError(code)) {
-      return JSON_RPC_SERVER_ERROR_MESSAGE
-    }
-  }
-  return fallbackMessage
-}
-
-/**
- * Returns whether the given code is valid.
- * A code is only valid if it has a message.
- *
- * @param {number} code - The code to check
- * @return {boolean} true if the code is valid, false otherwise.
- */
-function isValidCode (code) {
-
-  if (!Number.isInteger(code)) {
-    return false
-  }
-
-  const codeString = code.toString()
-  if (errorValues[codeString]) {
-    return true
-  }
-
-  if (isJsonRpcServerError(code)) {
-    return true
-  }
-
-  // TODO: allow valid codes and messages to be extended
-  // // EIP 1193 Status Codes
-  // if (code >= 4000 && code <= 4999) return true
-
-  return false
-}
-
-/**
- * Serializes the given error to an Ethereum JSON RPC-compatible error object.
- * Merely copies the given error's values if it is already compatible.
- * If the given error is not fully compatible, it will be preserved on the
- * returned object's data.originalError property.
- * Adds a 'stack' property if it exists on the given error.
- *
- * @param {any} error - The error to serialize.
- * @param {object} fallbackError - The custom fallback error values if the
- * given error is invalid.
- * @return {object} A standardized error object.
- */
-function serializeError (error, fallbackError = FALLBACK_ERROR) {
-
-  if (
-    !fallbackError ||
-    !Number.isInteger(fallbackError.code) ||
-    typeof fallbackError.message !== 'string'
-  ) {
-    throw new Error(
-      'fallbackError must contain integer number code and string message.',
-    )
-  }
-
-  if (error instanceof EthereumRpcError) {
-    return error.serialize()
-  }
-
-  const serialized = {}
-
-  if (error && isValidCode(error.code)) {
-
-    serialized.code = error.code
-
-    if (error.message && typeof error.message === 'string') {
-      serialized.message = error.message
-      if ('data' in error) {
-        serialized.data = error.data
-      }
-    } else {
-      serialized.message = getMessageFromCode(serialized.code)
-      serialized.data = { originalError: assignOriginalError(error) }
-    }
-
-  } else {
-    serialized.code = fallbackError.code
-    serialized.message = (
-      error && error.message
-        ? error.message
-        : fallbackError.message
-    )
-    serialized.data = { originalError: assignOriginalError(error) }
-  }
-
-  if (error && error.stack) {
-    serialized.stack = error.stack
-  }
-  return serialized
-}
-
-// Internal
-
-function isJsonRpcServerError (code) {
-  return code >= -32099 && code <= -32000
-}
-
-function assignOriginalError (error) {
-  if (error && typeof error === 'object' && !Array.isArray(error)) {
-    return { ...error }
-  }
-  return error
-}
-
-// Exports
-
-module.exports = {
-  getMessageFromCode,
-  isValidCode,
-  serializeError,
-  JSON_RPC_SERVER_ERROR_MESSAGE,
-}
-
-},{"./classes":509,"./errorCodes.json":510,"./errorValues.json":511}],514:[function(require,module,exports){
-arguments[4][508][0].apply(exports,arguments)
-},{"./src/classes":515,"./src/errorCodes.json":516,"./src/errors":518,"./src/utils":519,"dup":508}],515:[function(require,module,exports){
-arguments[4][509][0].apply(exports,arguments)
-},{"dup":509,"fast-safe-stringify":471}],516:[function(require,module,exports){
-arguments[4][510][0].apply(exports,arguments)
-},{"dup":510}],517:[function(require,module,exports){
-arguments[4][511][0].apply(exports,arguments)
-},{"dup":511}],518:[function(require,module,exports){
-arguments[4][512][0].apply(exports,arguments)
-},{"./classes":515,"./errorCodes.json":516,"./utils":519,"dup":512}],519:[function(require,module,exports){
-
-const errorValues = require('./errorValues.json')
-const FALLBACK_ERROR_CODE = require('./errorCodes.json').rpc.internal
-const { EthereumRpcError } = require('./classes')
-
-const JSON_RPC_SERVER_ERROR_MESSAGE = 'Unspecified server error.'
-
-const FALLBACK_MESSAGE = 'Unspecified error message. This is a bug, please report it.'
-
-const FALLBACK_ERROR = {
-  code: FALLBACK_ERROR_CODE,
-  message: getMessageFromCode(FALLBACK_ERROR_CODE),
-}
-
-/**
- * Gets the message for a given code, or a fallback message if the code has
- * no corresponding message.
- *
- * @param {number} code - The integer error code
- * @param {string} fallbackMessage - The fallback message
- * @return {string} The corresponding message or the fallback message
- */
-function getMessageFromCode (code, fallbackMessage = FALLBACK_MESSAGE) {
-
-  if (Number.isInteger(code)) {
-
-    const codeString = code.toString()
-
-    if (errorValues[codeString]) {
-      return errorValues[codeString].message
-    }
-    if (isJsonRpcServerError(code)) {
-      return JSON_RPC_SERVER_ERROR_MESSAGE
-    }
-  }
-  return fallbackMessage
-}
-
-/**
- * Returns whether the given code is valid.
- * A code is only valid if it has a message.
- *
- * @param {number} code - The code to check
- * @return {boolean} true if the code is valid, false otherwise.
- */
-function isValidCode (code) {
-
-  if (!Number.isInteger(code)) {
-    return false
-  }
-
-  const codeString = code.toString()
-  if (errorValues[codeString]) {
-    return true
-  }
-
-  if (isJsonRpcServerError(code)) {
-    return true
-  }
-
-  // TODO: allow valid codes and messages to be extended
-  // // EIP 1193 Status Codes
-  // if (code >= 4000 && code <= 4999) return true
-
-  return false
-}
-
-/**
- * Serializes the given error to an Ethereum JSON RPC-compatible error object.
- * Merely copies the given error's values if it is already compatible.
- * If the given error is not fully compatible, it will be preserved on the
- * returned object's data.originalError property.
- *
- * @param {any} error - The error to serialize.
- * @param {Object} [options] - An options object.
- * @param {Object} [options.fallbackError] - The custom fallback error values if
- * the given error is invalid.
- * @param {boolean} [options.shouldIncludeStack] - Whether the 'stack' property
- * of the given error should be included on the serialized error, if present.
- * @return {Object} A standardized, plain error object.
- */
-function serializeError (
-  error,
-  { fallbackError = FALLBACK_ERROR, shouldIncludeStack = false } = {},
-) {
-
-  if (
-    !fallbackError ||
-    !Number.isInteger(fallbackError.code) ||
-    typeof fallbackError.message !== 'string'
-  ) {
-    throw new Error(
-      'Must provide fallback error with integer number code and string message.',
-    )
-  }
-
-  if (error instanceof EthereumRpcError) {
-    return error.serialize()
-  }
-
-  const serialized = {}
-
-  if (error && isValidCode(error.code)) {
-
-    serialized.code = error.code
-
-    if (error.message && typeof error.message === 'string') {
-      serialized.message = error.message
-      if ('data' in error) {
-        serialized.data = error.data
-      }
-    } else {
-      serialized.message = getMessageFromCode(serialized.code)
-      serialized.data = { originalError: assignOriginalError(error) }
-    }
-
-  } else {
-    serialized.code = fallbackError.code
-    serialized.message = (
-      error && error.message
-        ? error.message
-        : fallbackError.message
-    )
-    serialized.data = { originalError: assignOriginalError(error) }
-  }
-
-  if (shouldIncludeStack && error && typeof error.stack === 'string') {
-    serialized.stack = error.stack
-  }
-  return serialized
-}
-
-// Internal
-
-function isJsonRpcServerError (code) {
-  return code >= -32099 && code <= -32000
-}
-
-function assignOriginalError (error) {
-  if (error && typeof error === 'object' && !Array.isArray(error)) {
-    return { ...error }
-  }
-  return error
-}
-
-// Exports
-
-module.exports = {
-  getMessageFromCode,
-  isValidCode,
-  serializeError,
-  JSON_RPC_SERVER_ERROR_MESSAGE,
-}
-
-},{"./classes":515,"./errorCodes.json":516,"./errorValues.json":517}],520:[function(require,module,exports){
-// uint32 (two's complement) max
-// more conservative than Number.MAX_SAFE_INTEGER
-const MAX = 4294967295
-let idCounter = Math.floor(Math.random() * MAX)
-
-module.exports = function getUniqueId () {
-  idCounter = (idCounter + 1) % MAX
-  return idCounter
-}
-
-},{}],521:[function(require,module,exports){
-const getUniqueId = require('./getUniqueId')
-
-module.exports = function createIdRemapMiddleware () {
-  return (req, res, next, _end) => {
-    const originalId = req.id
-    const newId = getUniqueId()
-    req.id = newId
-    res.id = newId
-    next((done) => {
-      req.id = originalId
-      res.id = originalId
-      done()
-    })
-  }
-}
-
-},{"./getUniqueId":520}],522:[function(require,module,exports){
-'use strict'
-
-const SafeEventEmitter = require('safe-event-emitter')
-const {
-  serializeError,
-  EthereumRpcError,
-  ERROR_CODES,
-} = require('eth-rpc-errors')
-
-module.exports = class JsonRpcEngine extends SafeEventEmitter {
-  constructor () {
-    super()
-    this._middleware = []
-  }
-
-  //
-  // Public
-  //
-
-  push (middleware) {
-    this._middleware.push(middleware)
-  }
-
-  handle (req, cb) {
-
-    if (Array.isArray(req)) {
-      if (cb) {
-        this._handleBatch(req)
-          .then((res) => cb(null, res))
-          .catch((err) => cb(err)) // fatal error
-        return undefined
-      }
-      return this._handleBatch(req)
-    }
-
-    if (!cb) {
-      return this._promiseHandle(req)
-    }
-    return this._handle(req, cb)
-  }
-
-  //
-  // Private
-  //
-
-  async _handleBatch (reqs) {
-    // The order here is important
-    // 3. Return batch response, or reject on some kind of fatal error
-    return await Promise.all( // 2. Wait for all requests to finish
-      // 1. Begin executing each request in the order received
-      reqs.map(this._promiseHandle.bind(this)),
-    )
-  }
-
-  _promiseHandle (req) {
-    return new Promise((resolve) => {
-      this._handle(req, (_err, res) => {
-        // there will always be a response, and it will always have any error
-        // that is caught and propagated
-        resolve(res)
-      })
-    })
-  }
-
-  _handle (callerReq, cb) {
-
-    const req = Object.assign({}, callerReq)
-    const res = {
-      id: req.id,
-      jsonrpc: req.jsonrpc,
-    }
-
-    let processingError
-
-    this._processRequest(req, res)
-      .catch((error) => {
-        // either from return handlers or something unexpected
-        processingError = error
-      })
-      .finally(() => {
-
-        // preserve unserialized error, if any, for use in callback
-        const responseError = res._originalError
-        delete res._originalError
-
-        const error = responseError || processingError || null
-
-        if (error) {
-          // ensure no result is present on an errored response
-          delete res.result
-          if (!res.error) {
-            res.error = serializeError(error)
-          }
-        }
-
-        cb(error, res)
-      })
-  }
-
-  async _processRequest (req, res) {
-    const { isComplete, returnHandlers } = await this._runAllMiddleware(req, res)
-    this._checkForCompletion(req, res, isComplete)
-    await this._runReturnHandlers(returnHandlers)
-  }
-
-  async _runReturnHandlers (handlers) {
-    for (const handler of handlers) {
-      await new Promise((resolve, reject) => {
-        handler((err) => (err ? reject(err) : resolve()))
-      })
-    }
-  }
-
-  _checkForCompletion (req, res, isComplete) {
-    if (!('result' in res) && !('error' in res)) {
-      const requestBody = JSON.stringify(req, null, 2)
-      const message = `JsonRpcEngine: Response has no error or result for request:\n${requestBody}`
-      throw new EthereumRpcError(ERROR_CODES.rpc.internal, message, req)
-    }
-    if (!isComplete) {
-      const requestBody = JSON.stringify(req, null, 2)
-      const message = `JsonRpcEngine: Nothing ended request:\n${requestBody}`
-      throw new EthereumRpcError(ERROR_CODES.rpc.internal, message, req)
-    }
-  }
-
-  // walks down stack of middleware
-  async _runAllMiddleware (req, res) {
-
-    const returnHandlers = []
-    // flag for early return
-    let isComplete = false
-
-    // go down stack of middleware, call and collect optional returnHandlers
-    for (const middleware of this._middleware) {
-      isComplete = await JsonRpcEngine._runMiddleware(
-        req, res, middleware, returnHandlers,
-      )
-      if (isComplete) {
-        break
-      }
-    }
-    return { isComplete, returnHandlers: returnHandlers.reverse() }
-  }
-
-  // runs an individual middleware
-  static _runMiddleware (req, res, middleware, returnHandlers) {
-    return new Promise((resolve) => {
-
-      const end = (err) => {
-        const error = err || (res && res.error)
-        if (error) {
-          res.error = serializeError(error)
-          res._originalError = error
-        }
-        resolve(true) // true indicates the request should end
-      }
-
-      const next = (returnHandler) => {
-        if (res.error) {
-          end(res.error)
-        } else {
-          if (returnHandler) {
-            returnHandlers.push(returnHandler)
-          }
-          resolve(false) // false indicates the request should not end
-        }
-      }
-
-      try {
-        middleware(req, res, next, end)
-      } catch (error) {
-        end(error)
-      }
-    })
-  }
-}
-
-},{"eth-rpc-errors":514,"safe-event-emitter":625}],523:[function(require,module,exports){
-const SafeEventEmitter = require('safe-event-emitter')
-const DuplexStream = require('readable-stream').Duplex
-
-module.exports = createStreamMiddleware
-
-function createStreamMiddleware() {
-  const idMap = {}
-  const stream = new DuplexStream({
-    objectMode: true,
-    read: readNoop,
-    write: processMessage,
-  })
-
-  const events = new SafeEventEmitter()
-
-  const middleware = (req, res, next, end) => {
-    // write req to stream
-    stream.push(req)
-    // register request on id map
-    idMap[req.id] = { req, res, next, end }
-  }
-
-  return { events, middleware, stream }
-
-  function readNoop () {
-    return false
-  }
-
-  function processMessage (res, encoding, cb) {
-    let err
-    try {
-      const isNotification = !res.id
-      if (isNotification) {
-        processNotification(res)
-      } else {
-        processResponse(res)
-      }
-    } catch (_err) {
-      err = _err
-    }
-    // continue processing stream
-    cb(err)
-  }
-
-  function processResponse(res) {
-    const context = idMap[res.id]
-    if (!context) throw new Error(`StreamMiddleware - Unknown response id ${res.id}`)
-    delete idMap[res.id]
-    // copy whole res onto original res
-    Object.assign(context.res, res)
-    // run callback on empty stack,
-    // prevent internal stream-handler from catching errors
-    setTimeout(context.end)
-  }
-
-  function processNotification(res) {
-    events.emit('notification', res)
-  }
-
-}
-
-},{"readable-stream":621,"safe-event-emitter":625}],524:[function(require,module,exports){
-const pump = require('pump')
-const RpcEngine = require('json-rpc-engine')
-const createIdRemapMiddleware = require('json-rpc-engine/src/idRemapMiddleware')
-const createJsonRpcStream = require('json-rpc-middleware-stream')
-const ObservableStore = require('obs-store')
-const asStream = require('obs-store/lib/asStream')
-const ObjectMultiplex = require('obj-multiplex')
-const SafeEventEmitter = require('safe-event-emitter')
-const dequal = require('fast-deep-equal')
-const { ethErrors } = require('eth-rpc-errors')
-const { duplex: isDuplex } = require('is-stream')
-
-const messages = require('./messages')
-const { sendSiteMetadata } = require('./siteMetadata')
-const {
-  createErrorMiddleware,
-  EMITTED_NOTIFICATIONS,
-  getRpcPromiseCallback,
-  logStreamDisconnectWarning,
-  NOOP,
-} = require('./utils')
-
-let log
-
-/**
- * @typedef {Object} ConsoleLike
- * @property {function} debug - Like console.debug
- * @property {function} error - Like console.error
- * @property {function} info - Like console.info
- * @property {function} log - Like console.log
- * @property {function} trace - Like console.trace
- * @property {function} warn - Like console.warn
- */
-
-module.exports = class MetaMaskInpageProvider extends SafeEventEmitter {
-
-  /**
-   * @param {Object} connectionStream - A Node.js duplex stream
-   * @param {Object} options - An options bag
-   * @param {ConsoleLike} [options.logger] - The logging API to use. Default: console
-   * @param {number} [options.maxEventListeners] - The maximum number of event
-   * listeners. Default: 100
-   * @param {boolean} [options.shouldSendMetadata] - Whether the provider should
-   * send page metadata. Default: true
-   */
-  constructor (
-    connectionStream,
-    {
-      logger = console,
-      maxEventListeners = 100,
-      shouldSendMetadata = true,
-    } = {},
-  ) {
-
-    validateLoggerObject(logger)
-    log = logger
-
-    if (!isDuplex(connectionStream)) {
-      throw new Error(messages.errors.invalidDuplexStream())
-    }
-
-    if (
-      typeof maxEventListeners !== 'number' ||
-      typeof shouldSendMetadata !== 'boolean'
-    ) {
-      throw new Error(messages.errors.invalidOptions(
-        maxEventListeners, shouldSendMetadata,
-      ))
-    }
-
-    super()
-
-    this.isMetaMask = true
-
-    this.setMaxListeners(maxEventListeners)
-
-    // private state
-    this._state = {
-      sentWarnings: {
-        // methods
-        enable: false,
-        experimentalMethods: false,
-        send: false,
-        // events
-        events: {
-          chainIdChanged: false,
-          close: false,
-          data: false,
-          networkChanged: false,
-          notification: false,
-        },
-        // misc
-        // TODO:deprecation:remove
-        autoRefresh: false,
-        publicConfigStore: false,
-      },
-      isConnected: undefined,
-      accounts: undefined,
-      isUnlocked: undefined,
-    }
-
-    this._metamask = this._getExperimentalApi()
-
-    // public state
-    this.selectedAddress = null
-    this.networkVersion = null
-    this.chainId = null
-
-    // bind functions (to prevent e.g. web3@1.x from making unbound calls)
-    this._handleAccountsChanged = this._handleAccountsChanged.bind(this)
-    this._handleDisconnect = this._handleDisconnect.bind(this)
-    this._sendSync = this._sendSync.bind(this)
-    this._rpcRequest = this._rpcRequest.bind(this)
-    this._warnOfDeprecation = this._warnOfDeprecation.bind(this)
-    this.enable = this.enable.bind(this)
-    this.request = this.request.bind(this)
-    this.send = this.send.bind(this)
-    this.sendAsync = this.sendAsync.bind(this)
-
-    // setup connectionStream multiplexing
-    const mux = new ObjectMultiplex()
-    pump(
-      connectionStream,
-      mux,
-      connectionStream,
-      this._handleDisconnect.bind(this, 'MetaMask'),
-    )
-
-    // subscribe to metamask public config (one-way)
-    this._publicConfigStore = new ObservableStore({ storageKey: 'MetaMask-Config' })
-
-    // handle isUnlocked changes, and chainChanged and networkChanged events
-    this._publicConfigStore.subscribe((state) => {
-
-      if ('isUnlocked' in state && state.isUnlocked !== this._state.isUnlocked) {
-        this._state.isUnlocked = state.isUnlocked
-        if (this._state.isUnlocked) {
-          // this will get the exposed accounts, if any
-          try {
-            this._rpcRequest(
-              { method: 'eth_accounts', params: [] },
-              NOOP,
-              true, // indicating that eth_accounts _should_ update accounts
-            )
-          } catch (_) { /* no-op */ }
-        } else {
-          // accounts are never exposed when the extension is locked
-          this._handleAccountsChanged([])
-        }
-      }
-
-      // Emit chainChanged event on chain change
-      if ('chainId' in state && state.chainId !== this.chainId) {
-        this.chainId = state.chainId || null
-        this.emit('chainChanged', this.chainId)
-        this.emit('chainIdChanged', this.chainId) // TODO:deprecation:remove
-      }
-
-      // Emit networkChanged event on network change
-      if ('networkVersion' in state && state.networkVersion !== this.networkVersion) {
-        this.networkVersion = state.networkVersion || null
-        this.emit('networkChanged', this.networkVersion)
-      }
-    })
-
-    pump(
-      mux.createStream('publicConfig'),
-      asStream(this._publicConfigStore),
-      // RPC requests should still work if only this stream fails
-      logStreamDisconnectWarning.bind(this, log, 'MetaMask PublicConfigStore'),
-    )
-
-    // ignore phishing warning message (handled elsewhere)
-    mux.ignoreStream('phishing')
-
-    // setup own event listeners
-
-    // EIP-1193 connect
-    this.on('connect', () => {
-      this._state.isConnected = true
-    })
-
-    // setup RPC connection
-
-    const jsonRpcConnection = createJsonRpcStream()
-    pump(
-      jsonRpcConnection.stream,
-      mux.createStream('provider'),
-      jsonRpcConnection.stream,
-      this._handleDisconnect.bind(this, 'MetaMask RpcProvider'),
-    )
-
-    // handle RPC requests via dapp-side rpc engine
-    const rpcEngine = new RpcEngine()
-    rpcEngine.push(createIdRemapMiddleware())
-    rpcEngine.push(createErrorMiddleware(log))
-    rpcEngine.push(jsonRpcConnection.middleware)
-    this._rpcEngine = rpcEngine
-
-    // json rpc notification listener
-    jsonRpcConnection.events.on('notification', (payload) => {
-
-      const { method, params, result } = payload
-
-      if (method === 'wallet_accountsChanged') {
-        this._handleAccountsChanged(result)
-        return
-      }
-
-      if (EMITTED_NOTIFICATIONS.includes(method)) {
-        this.emit('data', payload) // deprecated
-
-        this.emit('message', {
-          type: method,
-          data: params,
-        })
-
-        // deprecated
-        this.emit('notification', params.result)
-      }
-    })
-
-    // miscellanea
-
-    // send website metadata
-    if (shouldSendMetadata) {
-      const domContentLoadedHandler = () => {
-        sendSiteMetadata(this._rpcEngine, log)
-        window.removeEventListener('DOMContentLoaded', domContentLoadedHandler)
-      }
-      window.addEventListener('DOMContentLoaded', domContentLoadedHandler)
-    }
-
-    // indicate that we've connected, for EIP-1193 compliance
-    setTimeout(() => this.emit('connect', { chainId: this.chainId }))
-
-    // TODO:deprecation:remove
-    /** @deprecated */
-    this._web3Ref = undefined
-
-    // TODO:deprecation:remove
-    // if true, MetaMask reloads the page if window.web3 has been accessed
-    /** @deprecated */
-    this.autoRefreshOnNetworkChange = true
-
-    // TODO:deprecation:remove
-    // wait a second to attempt to send this, so that the warning can be silenced
-    setTimeout(() => {
-      if (this.autoRefreshOnNetworkChange && !this._state.sentWarnings.autoRefresh) {
-        log.warn(messages.warnings.autoRefreshDeprecation)
-        this._state.sentWarnings.autoRefresh = true
-      }
-    }, 1000)
-  }
-
-  get publicConfigStore () {
-    if (!this._state.sentWarnings.publicConfigStore) {
-      log.warn(messages.warnings.publicConfigStore)
-      this._state.sentWarnings.publicConfigStore = true
-    }
-    return this._publicConfigStore
-  }
-
-  //====================
-  // Public Methods
-  //====================
-
-  /**
-   * Returns whether the provider can process RPC requests.
-   */
-  isConnected () {
-    return this._state.isConnected
-  }
-
-  /**
-   * Submits an RPC request for the given method, with the given params.
-   * Resolves with the result of the method call, or rejects on error.
-   *
-   * @param {Object} args - The RPC request arguments.
-   * @param {string} args.method - The RPC method name.
-   * @param {unknown[] | Object} [args.params] - The parameters for the RPC method.
-   * @returns {Promise<unknown>} A Promise that resolves with the result of the RPC method,
-   * or rejects if an error is encountered.
-   */
-  async request (args) {
-
-    if (!args || typeof args !== 'object' || Array.isArray(args)) {
-      throw ethErrors.rpc.invalidRequest({
-        message: messages.errors.invalidRequestArgs(),
-        data: args,
-      })
-    }
-
-    const { method, params } = args
-
-    if (typeof method !== 'string' || method.length === 0) {
-      throw ethErrors.rpc.invalidRequest({
-        message: messages.errors.invalidRequestMethod(),
-        data: args,
-      })
-    }
-
-    if (
-      params !== undefined && !Array.isArray(params) &&
-      (typeof params !== 'object' || params === null)
-    ) {
-      throw ethErrors.rpc.invalidRequest({
-        message: messages.errors.invalidRequestParams(),
-        data: args,
-      })
-    }
-
-    return new Promise((resolve, reject) => {
-      this._rpcRequest(
-        { method, params },
-        getRpcPromiseCallback(resolve, reject),
-      )
-    })
-  }
-
-  /**
-   * Submits an RPC request per the given JSON-RPC request object.
-   *
-   * @param {Object} payload - The RPC request object.
-   * @param {Function} cb - The callback function.
-   */
-  sendAsync (payload, cb) {
-    this._rpcRequest(payload, cb)
-  }
-
-  /**
-   * We override the following event methods so that we can warn consumers
-   * about deprecated events:
-   *   addListener, on, once, prependListener, prependOnceListener
-   */
-
-  /**
-   * @inheritdoc
-   */
-  addListener (eventName, listener) {
-    this._warnOfDeprecation(eventName)
-    return super.addListener(eventName, listener)
-  }
-
-  /**
-   * @inheritdoc
-   */
-  on (eventName, listener) {
-    this._warnOfDeprecation(eventName)
-    return super.on(eventName, listener)
-  }
-
-  /**
-   * @inheritdoc
-   */
-  once (eventName, listener) {
-    this._warnOfDeprecation(eventName)
-    return super.once(eventName, listener)
-  }
-
-  /**
-   * @inheritdoc
-   */
-  prependListener (eventName, listener) {
-    this._warnOfDeprecation(eventName)
-    return super.prependListener(eventName, listener)
-  }
-
-  /**
-   * @inheritdoc
-   */
-  prependOnceListener (eventName, listener) {
-    this._warnOfDeprecation(eventName)
-    return super.prependOnceListener(eventName, listener)
-  }
-
-  //====================
-  // Private Methods
-  //====================
-
-  /**
-   * Internal RPC method. Forwards requests to background via the RPC engine.
-   * Also remap ids inbound and outbound.
-   *
-   * @param {Object} payload - The RPC request object.
-   * @param {Function} callback - The consumer's callback.
-   * @param {boolean} [isInternal=false] - Whether the request is internal.
-   */
-  _rpcRequest (payload, callback, isInternal = false) {
-
-    let cb = callback
-
-    if (!Array.isArray(payload)) {
-
-      if (!payload.jsonrpc) {
-        payload.jsonrpc = '2.0'
-      }
-
-      if (
-        payload.method === 'eth_accounts' ||
-        payload.method === 'eth_requestAccounts'
-      ) {
-
-        // handle accounts changing
-        cb = (err, res) => {
-          this._handleAccountsChanged(
-            res.result || [],
-            payload.method === 'eth_accounts',
-            isInternal,
-          )
-          callback(err, res)
-        }
-      }
-    }
-    this._rpcEngine.handle(payload, cb)
-  }
-
-  /**
-   * Called when connection is lost to critical streams.
-   */
-  _handleDisconnect (streamName, err) {
-
-    logStreamDisconnectWarning.bind(this)(log, streamName, err)
-
-    const disconnectError = {
-      code: 1011,
-      reason: messages.errors.disconnected(),
-    }
-
-    if (this._state.isConnected) {
-      this.emit('disconnect', disconnectError)
-      this.emit('close', disconnectError) // deprecated
-    }
-    this._state.isConnected = false
-  }
-
-  /**
-   * Called when accounts may have changed. Diffs the new accounts value with
-   * the current one, updates all state as necessary, and emits the
-   * accountsChanged event.
-   *
-   * @param {string[]} accounts - The new accounts value.
-   * @param {boolean} isEthAccounts - Whether the accounts value was returned by
-   * a call to eth_accounts.
-   * @param {boolean} isInternal - Whether the accounts value was returned by an
-   * internally initiated request.
-   */
-  _handleAccountsChanged (accounts, isEthAccounts = false, isInternal = false) {
-
-    let _accounts = accounts
-
-    if (!Array.isArray(accounts)) {
-      log.error(
-        'MetaMask: Received non-array accounts parameter. Please report this bug.',
-        accounts,
-      )
-      _accounts = []
-    }
-
-    // emit accountsChanged if anything about the accounts array has changed
-    if (!dequal(this._state.accounts, _accounts)) {
-
-      // we should always have the correct accounts even before eth_accounts
-      // returns, except in cases where isInternal is true
-      if (isEthAccounts && this._state.accounts !== undefined && !isInternal) {
-        log.error(
-          `MetaMask: 'eth_accounts' unexpectedly updated accounts. Please report this bug.`,
-          _accounts,
-        )
-      }
-
-      this._state.accounts = _accounts
-
-      // handle selectedAddress
-      if (this.selectedAddress !== _accounts[0]) {
-        this.selectedAddress = _accounts[0] || null
-      }
-
-      // TODO:deprecation:remove
-      // handle web3
-      if (this._web3Ref) {
-        this._web3Ref.defaultAccount = this.selectedAddress
-      } else if (
-        window.web3 &&
-        window.web3.eth &&
-        typeof window.web3.eth === 'object'
-      ) {
-        window.web3.eth.defaultAccount = this.selectedAddress
-      }
-
-      // only emit the event once all state has been updated
-      this.emit('accountsChanged', _accounts)
-    }
-  }
-
-  /**
-   * Warns of deprecation for the given event, if applicable.
-   */
-  _warnOfDeprecation (eventName) {
-    if (this._state.sentWarnings.events[eventName] === false) {
-      log.warn(messages.warnings.events[eventName])
-      this._state.sentWarnings.events[eventName] = true
-    }
-  }
-
-  /**
-   * Constructor helper.
-   * Gets experimental _metamask API as Proxy, so that we can warn consumers
-   * about its experiment nature.
-   */
-  _getExperimentalApi () {
-
-    return new Proxy(
-      {
-
-        /**
-         * Determines if MetaMask is unlocked by the user.
-         *
-         * @returns {Promise<boolean>} - Promise resolving to true if MetaMask is currently unlocked
-         */
-        isUnlocked: async () => {
-          if (this._state.isUnlocked === undefined) {
-            await new Promise(
-              (resolve) => this._publicConfigStore.once('update', () => resolve()),
-            )
-          }
-          return this._state.isUnlocked
-        },
-
-        /**
-         * Make a batch RPC request.
-         */
-        requestBatch: async (requests) => {
-
-          if (!Array.isArray(requests)) {
-            throw ethErrors.rpc.invalidRequest({
-              message: 'Batch requests must be made with an array of request objects.',
-              data: requests,
-            })
-          }
-
-          return new Promise((resolve, reject) => {
-            this._rpcRequest(
-              requests,
-              getRpcPromiseCallback(resolve, reject),
-            )
-          })
-        },
-
-        // TODO:deprecation:remove isEnabled, isApproved
-        /**
-         * Synchronously determines if this domain is currently enabled, with a potential false negative if called to soon
-         *
-         * @deprecated
-         * @returns {boolean} - returns true if this domain is currently enabled
-         */
-        isEnabled: () => {
-          return Array.isArray(this._state.accounts) && this._state.accounts.length > 0
-        },
-
-        /**
-         * Asynchronously determines if this domain is currently enabled
-         *
-         * @deprecated
-         * @returns {Promise<boolean>} - Promise resolving to true if this domain is currently enabled
-         */
-        isApproved: async () => {
-          if (this._state.accounts === undefined) {
-            await new Promise(
-              (resolve) => this.once('accountsChanged', () => resolve()),
-            )
-          }
-          return Array.isArray(this._state.accounts) && this._state.accounts.length > 0
-        },
-      },
-      {
-        get: (obj, prop) => {
-
-          if (!this._state.sentWarnings.experimentalMethods) {
-            log.warn(messages.warnings.experimentalMethods)
-            this._state.sentWarnings.experimentalMethods = true
-          }
-          return obj[prop]
-        },
-      },
-    )
-  }
-
-  //====================
-  // Deprecated Methods
-  //====================
-
-  /**
-   * Equivalent to: ethereum.request('eth_requestAccounts')
-   *
-   * @deprecated
-   * @returns {Promise<Array<string>>} - A promise that resolves to an array of addresses.
-   */
-  enable () {
-
-    if (!this._state.sentWarnings.enable) {
-      log.warn(messages.warnings.enableDeprecation)
-      this._state.sentWarnings.enable = true
-    }
-
-    return new Promise((resolve, reject) => {
-      try {
-        this._rpcRequest(
-          { method: 'eth_requestAccounts', params: [] },
-          getRpcPromiseCallback(resolve, reject),
-        )
-      } catch (error) {
-        reject(error)
-      }
-    })
-  }
-
-  /**
-   * Sends an RPC request to MetaMask.
-   * Many different return types, which is why this method should not be used.
-   *
-   * @deprecated
-   * @param {(string | Object)} methodOrPayload - The method name, or the RPC request object.
-   * @param {Array<any> | Function} [callbackOrArgs] - If given a method name, the method's parameters.
-   * @returns {unknown} - The method result, or a JSON RPC response object.
-   */
-  send (methodOrPayload, callbackOrArgs) {
-
-    if (!this._state.sentWarnings.send) {
-      log.warn(messages.warnings.sendDeprecation)
-      this._state.sentWarnings.send = true
-    }
-
-    if (
-      typeof methodOrPayload === 'string' &&
-      (!callbackOrArgs || Array.isArray(callbackOrArgs))
-    ) {
-      return new Promise((resolve, reject) => {
-        try {
-          this._rpcRequest(
-            { method: methodOrPayload, params: callbackOrArgs },
-            getRpcPromiseCallback(resolve, reject, false),
-          )
-        } catch (error) {
-          reject(error)
-        }
-      })
-    } else if (
-      typeof methodOrPayload === 'object' &&
-      typeof callbackOrArgs === 'function'
-    ) {
-      return this._rpcRequest(methodOrPayload, callbackOrArgs)
-    }
-    return this._sendSync(methodOrPayload)
-  }
-
-  /**
-   * Internal backwards compatibility method, used in send.
-   *
-   * @deprecated
-   */
-  _sendSync (payload) {
-
-    let result
-    switch (payload.method) {
-
-      case 'eth_accounts':
-        result = this.selectedAddress ? [this.selectedAddress] : []
-        break
-
-      case 'eth_coinbase':
-        result = this.selectedAddress || null
-        break
-
-      case 'eth_uninstallFilter':
-        this._rpcRequest(payload, NOOP)
-        result = true
-        break
-
-      case 'net_version':
-        result = this.networkVersion || null
-        break
-
-      default:
-        throw new Error(messages.errors.unsupportedSync(payload.method))
-    }
-
-    return {
-      id: payload.id,
-      jsonrpc: payload.jsonrpc,
-      result,
-    }
-  }
-}
-
-function validateLoggerObject (logger) {
-  if (logger !== console) {
-    if (typeof logger === 'object') {
-      const methodKeys = ['log', 'warn', 'error', 'debug', 'info', 'trace']
-      for (const key of methodKeys) {
-        if (typeof logger[key] !== 'function') {
-          throw new Error(messages.errors.invalidLoggerMethod(key))
-        }
-      }
-      return
-    }
-    throw new Error(messages.errors.invalidLoggerObject())
-  }
-}
-
-},{"./messages":526,"./siteMetadata":527,"./utils":528,"eth-rpc-errors":508,"fast-deep-equal":470,"is-stream":538,"json-rpc-engine":522,"json-rpc-engine/src/idRemapMiddleware":521,"json-rpc-middleware-stream":523,"obj-multiplex":584,"obs-store":587,"obs-store/lib/asStream":588,"pump":609,"safe-event-emitter":625}],525:[function(require,module,exports){
-const MetaMaskInpageProvider = require('./MetaMaskInpageProvider')
-
-/**
- * Initializes a MetaMaskInpageProvider and (optionally) assigns it as window.ethereum.
- *
- * @param {Object} options - An options bag.
- * @param {Object} options.connectionStream - A Node.js stream.
- * @param {number} options.maxEventListeners - The maximum number of event listeners.
- * @param {boolean} options.shouldSendMetadata - Whether the provider should send page metadata.
- * @param {boolean} options.shouldSetOnWindow - Whether the provider should be set as window.ethereum
- * @returns {MetaMaskInpageProvider | Proxy} The initialized provider (whether set or not).
- */
-function initProvider ({
-  connectionStream,
-  maxEventListeners = 100,
-  shouldSendMetadata = true,
-  shouldSetOnWindow = true,
-} = {}) {
-
-  let provider = new MetaMaskInpageProvider(
-    connectionStream, { shouldSendMetadata, maxEventListeners },
-  )
-
-  provider = new Proxy(provider, {
-    deleteProperty: () => true, // some libraries, e.g. web3@1.x, mess with our API
-  })
-
-  if (shouldSetOnWindow) {
-    setGlobalProvider(provider)
-  }
-
-  return provider
-}
-
-/**
- * Sets the given provider instance as window.ethereum and dispatches the
- * 'ethereum#initialized' event on window.
- *
- * @param {MetaMaskInpageProvider} providerInstance - The provider instance.
- */
-function setGlobalProvider (providerInstance) {
-  window.ethereum = providerInstance
-  window.dispatchEvent(new Event('ethereum#initialized'))
-}
-
-module.exports = {
-  initProvider,
-  setGlobalProvider,
-}
-
-},{"./MetaMaskInpageProvider":524}],526:[function(require,module,exports){
-module.exports = {
-  errors: {
-    disconnected: () => `MetaMask: Lost connection to MetaMask background process.`,
-    sendSiteMetadata: () => `MetaMask: Failed to send site metadata. This is an internal error, please report this bug.`,
-    unsupportedSync: (method) => `MetaMask: The MetaMask Web3 object does not support synchronous methods like ${method} without a callback parameter.`,
-    invalidDuplexStream: () => 'Must provide a Node.js-style duplex stream.',
-    invalidOptions: (maxEventListeners, shouldSendMetadata) => `Invalid options. Received: { maxEventListeners: ${maxEventListeners}, shouldSendMetadata: ${shouldSendMetadata} }`,
-    invalidRequestArgs: () => `Expected a single, non-array, object argument.`,
-    invalidRequestMethod: () => `'args.method' must be a non-empty string.`,
-    invalidRequestParams: () => `'args.params' must be an object or array if provided.`,
-    invalidLoggerObject: () => `'args.logger' must be an object if provided.`,
-    invalidLoggerMethod: (method) => `'args.logger' must include required method '${method}'.`,
-  },
-  warnings: {
-    // TODO:deprecation:remove
-    autoRefreshDeprecation: `MetaMask: MetaMask will soon stop reloading pages on network change.\nFor more information, see: https://docs.metamask.io/guide/ethereum-provider.html#ethereum-autorefreshonnetworkchange \nSet 'ethereum.autoRefreshOnNetworkChange' to 'false' to silence this warning.`,
-    // deprecated methods
-    enableDeprecation: `MetaMask: 'ethereum.enable()' is deprecated and may be removed in the future. Please use the 'eth_requestAccounts' RPC method instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1102`,
-    sendDeprecation: `MetaMask: 'ethereum.send(...)' is deprecated and may be removed in the future. Please use 'ethereum.sendAsync(...)' or 'ethereum.request(...)' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193`,
-    // deprecated events
-    events: {
-      chainIdChanged: `MetaMask: The event 'chainIdChanged' is deprecated and WILL be removed in the future. Please use 'chainChanged' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193`,
-      close: `MetaMask: The event 'close' is deprecated and may be removed in the future. Please use 'disconnect' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193`,
-      data: `MetaMask: The event 'data' is deprecated and may be removed in the future.`,
-      networkChanged: `MetaMask: The event 'networkChanged' is deprecated and may be removed in the future. Please use 'chainChanged' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193`,
-      notification: `MetaMask: The event 'notification' is deprecated and may be removed in the future. Please use 'message' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193`,
-    },
-    // misc
-    experimentalMethods: `MetaMask: 'ethereum._metamask' exposes non-standard, experimental methods. They may be removed or changed without warning.`,
-    publicConfigStore: `MetaMask: The property 'publicConfigStore' is deprecated and WILL be removed in the future.`,
-  },
-}
-
-},{}],527:[function(require,module,exports){
-
-const { errors } = require('./messages')
-const { NOOP } = require('./utils')
-
-module.exports = {
-  sendSiteMetadata,
-}
-
-/**
- * Sends site metadata over an RPC request.
- *
- * @param {JsonRpcEngine} engine - The JSON RPC Engine to send metadata over.
- * @param {Object} log - The logging API to use.
- */
-async function sendSiteMetadata (engine, log) {
-  try {
-    const domainMetadata = await getSiteMetadata()
-    // call engine.handle directly to avoid normal RPC request handling
-    engine.handle(
-      {
-        method: 'wallet_sendDomainMetadata',
-        domainMetadata,
-      },
-      NOOP,
-    )
-  } catch (error) {
-    log.error({
-      message: errors.sendSiteMetadata(),
-      originalError: error,
-    })
-  }
-}
-
-/**
- * Gets site metadata and returns it
- *
- */
-async function getSiteMetadata () {
-  return {
-    name: getSiteName(window),
-    icon: await getSiteIcon(window),
-  }
-}
-
-/**
- * Extracts a name for the site from the DOM
- */
-function getSiteName (window) {
-  const { document } = window
-
-  const siteName = document.querySelector('head > meta[property="og:site_name"]')
-  if (siteName) {
-    return siteName.content
-  }
-
-  const metaTitle = document.querySelector('head > meta[name="title"]')
-  if (metaTitle) {
-    return metaTitle.content
-  }
-
-  if (document.title && document.title.length > 0) {
-    return document.title
-  }
-
-  return window.location.hostname
-}
-
-/**
- * Extracts an icon for the site from the DOM
- * @returns {string|null} an icon URL
- */
-async function getSiteIcon (window) {
-  const { document } = window
-
-  const icons = document.querySelectorAll('head > link[rel~="icon"]')
-  for (const icon of icons) {
-    if (icon && await imgExists(icon.href)) {
-      return icon.href
-    }
-  }
-
-  return null
-}
-
-/**
- * Returns whether the given image URL exists
- * @param {string} url - the url of the image
- * @return {Promise<boolean>} whether the image exists
- */
-function imgExists (url) {
-  return new Promise((resolve, reject) => {
-    try {
-      const img = document.createElement('img')
-      img.onload = () => resolve(true)
-      img.onerror = () => resolve(false)
-      img.src = url
-    } catch (e) {
-      reject(e)
-    }
-  })
-}
-
-},{"./messages":526,"./utils":528}],528:[function(require,module,exports){
-const EventEmitter = require('events')
-const { ethErrors } = require('eth-rpc-errors')
-const SafeEventEmitter = require('safe-event-emitter')
-
-// utility functions
-
-/**
- * json-rpc-engine middleware that logs RPC errors and and validates req.method.
- *
- * @param {Object} log - The logging API to use.
- * @returns {Function} json-rpc-engine middleware function
- */
-function createErrorMiddleware (log) {
-  return (req, res, next) => {
-
-    // json-rpc-engine will terminate the request when it notices this error
-    if (typeof req.method !== 'string' || !req.method) {
-      res.error = ethErrors.rpc.invalidRequest({
-        message: `The request 'method' must be a non-empty string.`,
-        data: req,
-      })
-    }
-
-    next((done) => {
-      const { error } = res
-      if (!error) {
-        return done()
-      }
-      log.error(`MetaMask - RPC Error: ${error.message}`, error)
-      return done()
-    })
-  }
-}
-
-// resolve response.result or response, reject errors
-const getRpcPromiseCallback = (resolve, reject, unwrapResult = true) => (error, response) => {
-  if (error || response.error) {
-    reject(error || response.error)
-  } else {
-    !unwrapResult || Array.isArray(response)
-      ? resolve(response)
-      : resolve(response.result)
-  }
-}
-
-/**
- * Logs a stream disconnection error. Emits an 'error' if bound to an
- * EventEmitter that has listeners for the 'error' event.
- *
- * @param {Object} log - The logging API to use.
- * @param {string} remoteLabel - The label of the disconnected stream.
- * @param {Error} err - The associated error to log.
- */
-function logStreamDisconnectWarning (log, remoteLabel, err) {
-  let warningMsg = `MetaMaskInpageProvider - lost connection to ${remoteLabel}`
-  if (err) {
-    warningMsg += `\n${err.stack}`
-  }
-  log.warn(warningMsg)
-  if (this instanceof EventEmitter || this instanceof SafeEventEmitter) {
-    if (this.listenerCount('error') > 0) {
-      this.emit('error', warningMsg)
-    }
-  }
-}
-
-// eslint-disable-next-line no-empty-function
-const NOOP = () => {}
-
-// constants
-
-const EMITTED_NOTIFICATIONS = [
-  'eth_subscription', // per eth-json-rpc-filters/subscriptionManager
-]
-
-module.exports = {
-  createErrorMiddleware,
-  EMITTED_NOTIFICATIONS,
-  getRpcPromiseCallback,
-  logStreamDisconnectWarning,
-  NOOP,
-}
-
-},{"eth-rpc-errors":508,"events":110,"safe-event-emitter":625}],529:[function(require,module,exports){
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-const pump_1 = __importDefault(require("pump"));
-const json_rpc_engine_1 = require("json-rpc-engine");
-const json_rpc_middleware_stream_1 = require("json-rpc-middleware-stream");
-const object_multiplex_1 = __importDefault(require("@metamask/object-multiplex"));
-const safe_event_emitter_1 = __importDefault(require("@metamask/safe-event-emitter"));
-const fast_deep_equal_1 = __importDefault(require("fast-deep-equal"));
-const eth_rpc_errors_1 = require("eth-rpc-errors");
-const is_stream_1 = require("is-stream");
-const messages_1 = __importDefault(require("./messages"));
-const siteMetadata_1 = __importDefault(require("./siteMetadata"));
-const utils_1 = require("./utils");
-class MetaMaskInpageProvider extends safe_event_emitter_1.default {
-    /**
-     * @param connectionStream - A Node.js duplex stream
-     * @param options - An options bag
-     * @param options.jsonRpcStreamName - The name of the internal JSON-RPC stream.
-     * Default: metamask-provider
-     * @param options.logger - The logging API to use. Default: console
-     * @param options.maxEventListeners - The maximum number of event
-     * listeners. Default: 100
-     * @param options.shouldSendMetadata - Whether the provider should
-     * send page metadata. Default: true
-     */
-    constructor(connectionStream, { jsonRpcStreamName = 'metamask-provider', logger = console, maxEventListeners = 100, shouldSendMetadata = true, } = {}) {
-        if (!is_stream_1.duplex(connectionStream)) {
-            throw new Error(messages_1.default.errors.invalidDuplexStream());
-        }
-        if (typeof maxEventListeners !== 'number' ||
-            typeof shouldSendMetadata !== 'boolean') {
-            throw new Error(messages_1.default.errors.invalidOptions(maxEventListeners, shouldSendMetadata));
-        }
-        validateLoggerObject(logger);
-        super();
-        this._log = logger;
-        this.isMetaMask = true;
-        this.setMaxListeners(maxEventListeners);
-        // private state
-        this._state = {
-            sentWarnings: {
-                // methods
-                enable: false,
-                experimentalMethods: false,
-                send: false,
-                // events
-                events: {
-                    close: false,
-                    data: false,
-                    networkChanged: false,
-                    notification: false,
-                },
-            },
-            accounts: null,
-            isConnected: false,
-            isUnlocked: false,
-            initialized: false,
-            isPermanentlyDisconnected: false,
-        };
-        this._metamask = this._getExperimentalApi();
-        // public state
-        this.selectedAddress = null;
-        this.networkVersion = null;
-        this.chainId = null;
-        // bind functions (to prevent consumers from making unbound calls)
-        this._handleAccountsChanged = this._handleAccountsChanged.bind(this);
-        this._handleConnect = this._handleConnect.bind(this);
-        this._handleChainChanged = this._handleChainChanged.bind(this);
-        this._handleDisconnect = this._handleDisconnect.bind(this);
-        this._handleStreamDisconnect = this._handleStreamDisconnect.bind(this);
-        this._handleUnlockStateChanged = this._handleUnlockStateChanged.bind(this);
-        this._sendSync = this._sendSync.bind(this);
-        this._rpcRequest = this._rpcRequest.bind(this);
-        this._warnOfDeprecation = this._warnOfDeprecation.bind(this);
-        this.enable = this.enable.bind(this);
-        this.request = this.request.bind(this);
-        this.send = this.send.bind(this);
-        this.sendAsync = this.sendAsync.bind(this);
-        // setup connectionStream multiplexing
-        const mux = new object_multiplex_1.default();
-        pump_1.default(connectionStream, mux, connectionStream, this._handleStreamDisconnect.bind(this, 'MetaMask'));
-        // ignore phishing warning message (handled elsewhere)
-        mux.ignoreStream('phishing');
-        // setup own event listeners
-        // EIP-1193 connect
-        this.on('connect', () => {
-            this._state.isConnected = true;
-        });
-        // setup RPC connection
-        const jsonRpcConnection = json_rpc_middleware_stream_1.createStreamMiddleware();
-        pump_1.default(jsonRpcConnection.stream, mux.createStream(jsonRpcStreamName), jsonRpcConnection.stream, this._handleStreamDisconnect.bind(this, 'MetaMask RpcProvider'));
-        // handle RPC requests via dapp-side rpc engine
-        const rpcEngine = new json_rpc_engine_1.JsonRpcEngine();
-        rpcEngine.push(json_rpc_engine_1.createIdRemapMiddleware());
-        rpcEngine.push(utils_1.createErrorMiddleware(this._log));
-        rpcEngine.push(jsonRpcConnection.middleware);
-        this._rpcEngine = rpcEngine;
-        this._initializeState();
-        // handle JSON-RPC notifications
-        jsonRpcConnection.events.on('notification', (payload) => {
-            const { method, params } = payload;
-            if (method === 'metamask_accountsChanged') {
-                this._handleAccountsChanged(params);
-            }
-            else if (method === 'metamask_unlockStateChanged') {
-                this._handleUnlockStateChanged(params);
-            }
-            else if (method === 'metamask_chainChanged') {
-                this._handleChainChanged(params);
-            }
-            else if (utils_1.EMITTED_NOTIFICATIONS.includes(method)) {
-                // deprecated
-                // emitted here because that was the original order
-                this.emit('data', payload);
-                this.emit('message', {
-                    type: method,
-                    data: params,
-                });
-                // deprecated
-                this.emit('notification', payload.params.result);
-            }
-            else if (method === 'METAMASK_STREAM_FAILURE') {
-                connectionStream.destroy(new Error(messages_1.default.errors.permanentlyDisconnected()));
-            }
-        });
-        // miscellanea
-        // send website metadata
-        if (shouldSendMetadata) {
-            if (document.readyState === 'complete') {
-                siteMetadata_1.default(this._rpcEngine, this._log);
-            }
-            else {
-                const domContentLoadedHandler = () => {
-                    siteMetadata_1.default(this._rpcEngine, this._log);
-                    window.removeEventListener('DOMContentLoaded', domContentLoadedHandler);
-                };
-                window.addEventListener('DOMContentLoaded', domContentLoadedHandler);
-            }
-        }
-    }
-    //====================
-    // Public Methods
-    //====================
-    /**
-     * Returns whether the provider can process RPC requests.
-     */
-    isConnected() {
-        return this._state.isConnected;
-    }
-    /**
-     * Submits an RPC request for the given method, with the given params.
-     * Resolves with the result of the method call, or rejects on error.
-     *
-     * @param args - The RPC request arguments.
-     * @param args.method - The RPC method name.
-     * @param args.params - The parameters for the RPC method.
-     * @returns A Promise that resolves with the result of the RPC method,
-     * or rejects if an error is encountered.
-     */
-    async request(args) {
-        if (!args || typeof args !== 'object' || Array.isArray(args)) {
-            throw eth_rpc_errors_1.ethErrors.rpc.invalidRequest({
-                message: messages_1.default.errors.invalidRequestArgs(),
-                data: args,
-            });
-        }
-        const { method, params } = args;
-        if (typeof method !== 'string' || method.length === 0) {
-            throw eth_rpc_errors_1.ethErrors.rpc.invalidRequest({
-                message: messages_1.default.errors.invalidRequestMethod(),
-                data: args,
-            });
-        }
-        if (params !== undefined && !Array.isArray(params) &&
-            (typeof params !== 'object' || params === null)) {
-            throw eth_rpc_errors_1.ethErrors.rpc.invalidRequest({
-                message: messages_1.default.errors.invalidRequestParams(),
-                data: args,
-            });
-        }
-        return new Promise((resolve, reject) => {
-            this._rpcRequest({ method, params }, utils_1.getRpcPromiseCallback(resolve, reject));
-        });
-    }
-    /**
-     * Submits an RPC request per the given JSON-RPC request object.
-     *
-     * @param payload - The RPC request object.
-     * @param cb - The callback function.
-     */
-    sendAsync(payload, callback) {
-        this._rpcRequest(payload, callback);
-    }
-    /**
-     * We override the following event methods so that we can warn consumers
-     * about deprecated events:
-     *   addListener, on, once, prependListener, prependOnceListener
-     */
-    addListener(eventName, listener) {
-        this._warnOfDeprecation(eventName);
-        return super.addListener(eventName, listener);
-    }
-    on(eventName, listener) {
-        this._warnOfDeprecation(eventName);
-        return super.on(eventName, listener);
-    }
-    once(eventName, listener) {
-        this._warnOfDeprecation(eventName);
-        return super.once(eventName, listener);
-    }
-    prependListener(eventName, listener) {
-        this._warnOfDeprecation(eventName);
-        return super.prependListener(eventName, listener);
-    }
-    prependOnceListener(eventName, listener) {
-        this._warnOfDeprecation(eventName);
-        return super.prependOnceListener(eventName, listener);
-    }
-    //====================
-    // Private Methods
-    //====================
-    /**
-     * Constructor helper.
-     * Populates initial state by calling 'metamask_getProviderState' and emits
-     * necessary events.
-     */
-    async _initializeState() {
-        try {
-            const { accounts, chainId, isUnlocked, networkVersion, } = await this.request({
-                method: 'metamask_getProviderState',
-            });
-            // indicate that we've connected, for EIP-1193 compliance
-            this.emit('connect', { chainId });
-            this._handleChainChanged({ chainId, networkVersion });
-            this._handleUnlockStateChanged({ accounts, isUnlocked });
-            this._handleAccountsChanged(accounts);
-        }
-        catch (error) {
-            this._log.error('MetaMask: Failed to get initial state. Please report this bug.', error);
-        }
-        finally {
-            this._state.initialized = true;
-            this.emit('_initialized');
-        }
-    }
-    /**
-     * Internal RPC method. Forwards requests to background via the RPC engine.
-     * Also remap ids inbound and outbound.
-     *
-     * @param payload - The RPC request object.
-     * @param callback - The consumer's callback.
-     */
-    _rpcRequest(payload, callback) {
-        let cb = callback;
-        if (!Array.isArray(payload)) {
-            if (!payload.jsonrpc) {
-                payload.jsonrpc = '2.0';
-            }
-            if (payload.method === 'eth_accounts' ||
-                payload.method === 'eth_requestAccounts') {
-                // handle accounts changing
-                cb = (err, res) => {
-                    this._handleAccountsChanged(res.result || [], payload.method === 'eth_accounts');
-                    callback(err, res);
-                };
-            }
-            return this._rpcEngine.handle(payload, cb);
-        }
-        return this._rpcEngine.handle(payload, cb);
-    }
-    /**
-     * When the provider becomes connected, updates internal state and emits
-     * required events. Idempotent.
-     *
-     * @param chainId - The ID of the newly connected chain.
-     * @emits MetaMaskInpageProvider#connect
-     */
-    _handleConnect(chainId) {
-        if (!this._state.isConnected) {
-            this._state.isConnected = true;
-            this.emit('connect', { chainId });
-            this._log.debug(messages_1.default.info.connected(chainId));
-        }
-    }
-    /**
-     * When the provider becomes disconnected, updates internal state and emits
-     * required events. Idempotent with respect to the isRecoverable parameter.
-     *
-     * Error codes per the CloseEvent status codes as required by EIP-1193:
-     * https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent#Status_codes
-     *
-     * @param isRecoverable - Whether the disconnection is recoverable.
-     * @param errorMessage - A custom error message.
-     * @emits MetaMaskInpageProvider#disconnect
-     */
-    _handleDisconnect(isRecoverable, errorMessage) {
-        if (this._state.isConnected ||
-            (!this._state.isPermanentlyDisconnected && !isRecoverable)) {
-            this._state.isConnected = false;
-            let error;
-            if (isRecoverable) {
-                error = new eth_rpc_errors_1.EthereumRpcError(1013, // Try again later
-                errorMessage || messages_1.default.errors.disconnected());
-                this._log.debug(error);
-            }
-            else {
-                error = new eth_rpc_errors_1.EthereumRpcError(1011, // Internal error
-                errorMessage || messages_1.default.errors.permanentlyDisconnected());
-                this._log.error(error);
-                this.chainId = null;
-                this.networkVersion = null;
-                this._state.accounts = null;
-                this.selectedAddress = null;
-                this._state.isUnlocked = false;
-                this._state.isPermanentlyDisconnected = true;
-            }
-            this.emit('disconnect', error);
-            this.emit('close', error); // deprecated
-        }
-    }
-    /**
-     * Called when connection is lost to critical streams.
-     *
-     * @emits MetamaskInpageProvider#disconnect
-     */
-    _handleStreamDisconnect(streamName, error) {
-        utils_1.logStreamDisconnectWarning(this._log, streamName, error, this);
-        this._handleDisconnect(false, error ? error.message : undefined);
-    }
-    /**
-     * Upon receipt of a new chainId and networkVersion, emits corresponding
-     * events and sets relevant public state.
-     * Does nothing if neither the chainId nor the networkVersion are different
-     * from existing values.
-     *
-     * @emits MetamaskInpageProvider#chainChanged
-     * @param networkInfo - An object with network info.
-     * @param networkInfo.chainId - The latest chain ID.
-     * @param networkInfo.networkVersion - The latest network ID.
-     */
-    _handleChainChanged({ chainId, networkVersion, } = {}) {
-        if (!chainId || typeof chainId !== 'string' || !chainId.startsWith('0x') ||
-            !networkVersion || typeof networkVersion !== 'string') {
-            this._log.error('MetaMask: Received invalid network parameters. Please report this bug.', { chainId, networkVersion });
-            return;
-        }
-        if (networkVersion === 'loading') {
-            this._handleDisconnect(true);
-        }
-        else {
-            this._handleConnect(chainId);
-            if (chainId !== this.chainId) {
-                this.chainId = chainId;
-                if (this._state.initialized) {
-                    this.emit('chainChanged', this.chainId);
-                }
-            }
-            if (networkVersion !== this.networkVersion) {
-                this.networkVersion = networkVersion;
-                if (this._state.initialized) {
-                    this.emit('networkChanged', this.networkVersion);
-                }
-            }
-        }
-    }
-    /**
-     * Called when accounts may have changed. Diffs the new accounts value with
-     * the current one, updates all state as necessary, and emits the
-     * accountsChanged event.
-     *
-     * @param accounts - The new accounts value.
-     * @param isEthAccounts - Whether the accounts value was returned by
-     * a call to eth_accounts.
-     */
-    _handleAccountsChanged(accounts, isEthAccounts = false) {
-        let _accounts = accounts;
-        if (!Array.isArray(accounts)) {
-            this._log.error('MetaMask: Received invalid accounts parameter. Please report this bug.', accounts);
-            _accounts = [];
-        }
-        for (const account of accounts) {
-            if (typeof account !== 'string') {
-                this._log.error('MetaMask: Received non-string account. Please report this bug.', accounts);
-                _accounts = [];
-                break;
-            }
-        }
-        // emit accountsChanged if anything about the accounts array has changed
-        if (!fast_deep_equal_1.default(this._state.accounts, _accounts)) {
-            // we should always have the correct accounts even before eth_accounts
-            // returns
-            if (isEthAccounts && this._state.accounts !== null) {
-                this._log.error(`MetaMask: 'eth_accounts' unexpectedly updated accounts. Please report this bug.`, _accounts);
-            }
-            this._state.accounts = _accounts;
-            // handle selectedAddress
-            if (this.selectedAddress !== _accounts[0]) {
-                this.selectedAddress = _accounts[0] || null;
-            }
-            // finally, after all state has been updated, emit the event
-            if (this._state.initialized) {
-                this.emit('accountsChanged', _accounts);
-            }
-        }
-    }
-    /**
-     * Upon receipt of a new isUnlocked state, sets relevant public state.
-     * Calls the accounts changed handler with the received accounts, or an empty
-     * array.
-     *
-     * Does nothing if the received value is equal to the existing value.
-     * There are no lock/unlock events.
-     *
-     * @param opts - Options bag.
-     * @param opts.accounts - The exposed accounts, if any.
-     * @param opts.isUnlocked - The latest isUnlocked value.
-     */
-    _handleUnlockStateChanged({ accounts, isUnlocked, } = {}) {
-        if (typeof isUnlocked !== 'boolean') {
-            this._log.error('MetaMask: Received invalid isUnlocked parameter. Please report this bug.');
-            return;
-        }
-        if (isUnlocked !== this._state.isUnlocked) {
-            this._state.isUnlocked = isUnlocked;
-            this._handleAccountsChanged(accounts || []);
-        }
-    }
-    /**
-     * Warns of deprecation for the given event, if applicable.
-     */
-    _warnOfDeprecation(eventName) {
-        if (this._state.sentWarnings.events[eventName] === false) {
-            this._log.warn(messages_1.default.warnings.events[eventName]);
-            this._state.sentWarnings.events[eventName] = true;
-        }
-    }
-    /**
-     * Constructor helper.
-     * Gets experimental _metamask API as Proxy, so that we can warn consumers
-     * about its experiment nature.
-     */
-    _getExperimentalApi() {
-        return new Proxy({
-            /**
-             * Determines if MetaMask is unlocked by the user.
-             *
-             * @returns Promise resolving to true if MetaMask is currently unlocked
-             */
-            isUnlocked: async () => {
-                if (!this._state.initialized) {
-                    await new Promise((resolve) => {
-                        this.on('_initialized', () => resolve());
-                    });
-                }
-                return this._state.isUnlocked;
-            },
-            /**
-             * Make a batch RPC request.
-             */
-            requestBatch: async (requests) => {
-                if (!Array.isArray(requests)) {
-                    throw eth_rpc_errors_1.ethErrors.rpc.invalidRequest({
-                        message: 'Batch requests must be made with an array of request objects.',
-                        data: requests,
-                    });
-                }
-                return new Promise((resolve, reject) => {
-                    this._rpcRequest(requests, utils_1.getRpcPromiseCallback(resolve, reject));
-                });
-            },
-        }, {
-            get: (obj, prop, ...args) => {
-                if (!this._state.sentWarnings.experimentalMethods) {
-                    this._log.warn(messages_1.default.warnings.experimentalMethods);
-                    this._state.sentWarnings.experimentalMethods = true;
-                }
-                return Reflect.get(obj, prop, ...args);
-            },
-        });
-    }
-    //====================
-    // Deprecated Methods
-    //====================
-    /**
-     * Equivalent to: ethereum.request('eth_requestAccounts')
-     *
-     * @deprecated Use request({ method: 'eth_requestAccounts' }) instead.
-     * @returns A promise that resolves to an array of addresses.
-     */
-    enable() {
-        if (!this._state.sentWarnings.enable) {
-            this._log.warn(messages_1.default.warnings.enableDeprecation);
-            this._state.sentWarnings.enable = true;
-        }
-        return new Promise((resolve, reject) => {
-            try {
-                this._rpcRequest({ method: 'eth_requestAccounts', params: [] }, utils_1.getRpcPromiseCallback(resolve, reject));
-            }
-            catch (error) {
-                reject(error);
-            }
-        });
-    }
-    send(methodOrPayload, callbackOrArgs) {
-        if (!this._state.sentWarnings.send) {
-            this._log.warn(messages_1.default.warnings.sendDeprecation);
-            this._state.sentWarnings.send = true;
-        }
-        if (typeof methodOrPayload === 'string' &&
-            (!callbackOrArgs || Array.isArray(callbackOrArgs))) {
-            return new Promise((resolve, reject) => {
-                try {
-                    this._rpcRequest({ method: methodOrPayload, params: callbackOrArgs }, utils_1.getRpcPromiseCallback(resolve, reject, false));
-                }
-                catch (error) {
-                    reject(error);
-                }
-            });
-        }
-        else if (methodOrPayload &&
-            typeof methodOrPayload === 'object' &&
-            typeof callbackOrArgs === 'function') {
-            return this._rpcRequest(methodOrPayload, callbackOrArgs);
-        }
-        return this._sendSync(methodOrPayload);
-    }
-    /**
-     * Internal backwards compatibility method, used in send.
-     *
-     * @deprecated
-     */
-    _sendSync(payload) {
-        let result;
-        switch (payload.method) {
-            case 'eth_accounts':
-                result = this.selectedAddress ? [this.selectedAddress] : [];
-                break;
-            case 'eth_coinbase':
-                result = this.selectedAddress || null;
-                break;
-            case 'eth_uninstallFilter':
-                this._rpcRequest(payload, utils_1.NOOP);
-                result = true;
-                break;
-            case 'net_version':
-                result = this.networkVersion || null;
-                break;
-            default:
-                throw new Error(messages_1.default.errors.unsupportedSync(payload.method));
-        }
-        return {
-            id: payload.id,
-            jsonrpc: payload.jsonrpc,
-            result,
-        };
-    }
-}
-exports.default = MetaMaskInpageProvider;
-function validateLoggerObject(logger) {
-    if (logger !== console) {
-        if (typeof logger === 'object') {
-            const methodKeys = ['log', 'warn', 'error', 'debug', 'info', 'trace'];
-            for (const key of methodKeys) {
-                if (typeof logger[key] !== 'function') {
-                    throw new Error(messages_1.default.errors.invalidLoggerMethod(key));
-                }
-            }
-            return;
-        }
-        throw new Error(messages_1.default.errors.invalidLoggerObject());
-    }
-}
-
-},{"./messages":532,"./siteMetadata":534,"./utils":535,"@metamask/object-multiplex":298,"@metamask/safe-event-emitter":299,"eth-rpc-errors":423,"fast-deep-equal":470,"is-stream":538,"json-rpc-engine":546,"json-rpc-middleware-stream":550,"pump":609}],530:[function(require,module,exports){
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.shimWeb3 = exports.setGlobalProvider = exports.MetaMaskInpageProvider = exports.initializeProvider = void 0;
-const MetaMaskInpageProvider_1 = __importDefault(require("./MetaMaskInpageProvider"));
-exports.MetaMaskInpageProvider = MetaMaskInpageProvider_1.default;
-const initializeProvider_1 = require("./initializeProvider");
-Object.defineProperty(exports, "initializeProvider", { enumerable: true, get: function () { return initializeProvider_1.initializeProvider; } });
-Object.defineProperty(exports, "setGlobalProvider", { enumerable: true, get: function () { return initializeProvider_1.setGlobalProvider; } });
-const shimWeb3_1 = __importDefault(require("./shimWeb3"));
-exports.shimWeb3 = shimWeb3_1.default;
-
-},{"./MetaMaskInpageProvider":529,"./initializeProvider":531,"./shimWeb3":533}],531:[function(require,module,exports){
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.setGlobalProvider = exports.initializeProvider = void 0;
-const MetaMaskInpageProvider_1 = __importDefault(require("./MetaMaskInpageProvider"));
-const shimWeb3_1 = __importDefault(require("./shimWeb3"));
-/**
- * Initializes a MetaMaskInpageProvider and (optionally) assigns it as window.ethereum.
- *
- * @param options - An options bag.
- * @param options.connectionStream - A Node.js stream.
- * @param options.jsonRpcStreamName - The name of the internal JSON-RPC stream.
- * @param options.maxEventListeners - The maximum number of event listeners.
- * @param options.shouldSendMetadata - Whether the provider should send page metadata.
- * @param options.shouldSetOnWindow - Whether the provider should be set as window.ethereum.
- * @param options.shouldShimWeb3 - Whether a window.web3 shim should be injected.
- * @returns The initialized provider (whether set or not).
- */
-function initializeProvider({ connectionStream, jsonRpcStreamName, logger = console, maxEventListeners = 100, shouldSendMetadata = true, shouldSetOnWindow = true, shouldShimWeb3 = false, }) {
-    let provider = new MetaMaskInpageProvider_1.default(connectionStream, {
-        jsonRpcStreamName,
-        logger,
-        maxEventListeners,
-        shouldSendMetadata,
-    });
-    provider = new Proxy(provider, {
-        // some common libraries, e.g. web3@1.x, mess with our API
-        deleteProperty: () => true,
-    });
-    if (shouldSetOnWindow) {
-        setGlobalProvider(provider);
-    }
-    if (shouldShimWeb3) {
-        shimWeb3_1.default(provider, logger);
-    }
-    return provider;
-}
-exports.initializeProvider = initializeProvider;
-/**
- * Sets the given provider instance as window.ethereum and dispatches the
- * 'ethereum#initialized' event on window.
- *
- * @param providerInstance - The provider instance.
- */
-function setGlobalProvider(providerInstance) {
-    window.ethereum = providerInstance;
-    window.dispatchEvent(new Event('ethereum#initialized'));
-}
-exports.setGlobalProvider = setGlobalProvider;
-
-},{"./MetaMaskInpageProvider":529,"./shimWeb3":533}],532:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-const messages = {
-    errors: {
-        disconnected: () => 'MetaMask: Disconnected from chain. Attempting to connect.',
-        permanentlyDisconnected: () => 'MetaMask: Disconnected from MetaMask background. Page reload required.',
-        sendSiteMetadata: () => `MetaMask: Failed to send site metadata. This is an internal error, please report this bug.`,
-        unsupportedSync: (method) => `MetaMask: The MetaMask Ethereum provider does not support synchronous methods like ${method} without a callback parameter.`,
-        invalidDuplexStream: () => 'Must provide a Node.js-style duplex stream.',
-        invalidOptions: (maxEventListeners, shouldSendMetadata) => `Invalid options. Received: { maxEventListeners: ${maxEventListeners}, shouldSendMetadata: ${shouldSendMetadata} }`,
-        invalidRequestArgs: () => `Expected a single, non-array, object argument.`,
-        invalidRequestMethod: () => `'args.method' must be a non-empty string.`,
-        invalidRequestParams: () => `'args.params' must be an object or array if provided.`,
-        invalidLoggerObject: () => `'args.logger' must be an object if provided.`,
-        invalidLoggerMethod: (method) => `'args.logger' must include required method '${method}'.`,
-    },
-    info: {
-        connected: (chainId) => `MetaMask: Connected to chain with ID "${chainId}".`,
-    },
-    warnings: {
-        // deprecated methods
-        enableDeprecation: `MetaMask: 'ethereum.enable()' is deprecated and may be removed in the future. Please use the 'eth_requestAccounts' RPC method instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1102`,
-        sendDeprecation: `MetaMask: 'ethereum.send(...)' is deprecated and may be removed in the future. Please use 'ethereum.sendAsync(...)' or 'ethereum.request(...)' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193`,
-        // deprecated events
-        events: {
-            close: `MetaMask: The event 'close' is deprecated and may be removed in the future. Please use 'disconnect' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193#disconnect`,
-            data: `MetaMask: The event 'data' is deprecated and will be removed in the future. Use 'message' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193#message`,
-            networkChanged: `MetaMask: The event 'networkChanged' is deprecated and may be removed in the future. Use 'chainChanged' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193#chainchanged`,
-            notification: `MetaMask: The event 'notification' is deprecated and may be removed in the future. Use 'message' instead.\nFor more information, see: https://eips.ethereum.org/EIPS/eip-1193#message`,
-        },
-        // misc
-        experimentalMethods: `MetaMask: 'ethereum._metamask' exposes non-standard, experimental methods. They may be removed or changed without warning.`,
-    },
-};
-exports.default = messages;
-
-},{}],533:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-/**
- * If no existing window.web3 is found, this function injects a web3 "shim" to
- * not break dapps that rely on window.web3.currentProvider.
- *
- * @param provider - The provider to set as window.web3.currentProvider.
- * @param log - The logging API to use.
- */
-function shimWeb3(provider, log = console) {
-    let loggedCurrentProvider = false;
-    let loggedMissingProperty = false;
-    if (!window.web3) {
-        const SHIM_IDENTIFIER = '__isMetaMaskShim__';
-        let web3Shim = { currentProvider: provider };
-        Object.defineProperty(web3Shim, SHIM_IDENTIFIER, {
-            value: true,
-            enumerable: true,
-            configurable: false,
-            writable: false,
-        });
-        web3Shim = new Proxy(web3Shim, {
-            get: (target, property, ...args) => {
-                if (property === 'currentProvider' && !loggedCurrentProvider) {
-                    loggedCurrentProvider = true;
-                    log.warn('You are accessing the MetaMask window.web3.currentProvider shim. This property is deprecated; use window.ethereum instead. For details, see: https://docs.metamask.io/guide/provider-migration.html#replacing-window-web3');
-                }
-                else if (property !== SHIM_IDENTIFIER && !loggedMissingProperty) {
-                    loggedMissingProperty = true;
-                    log.error(`MetaMask no longer injects web3. For details, see: https://docs.metamask.io/guide/provider-migration.html#replacing-window-web3`);
-                    provider.request({ method: 'metamask_logWeb3ShimUsage' })
-                        .catch((error) => {
-                        log.debug('MetaMask: Failed to log web3 shim usage.', error);
-                    });
-                }
-                return Reflect.get(target, property, ...args);
-            },
-            set: (...args) => {
-                log.warn('You are accessing the MetaMask window.web3 shim. This object is deprecated; use window.ethereum instead. For details, see: https://docs.metamask.io/guide/provider-migration.html#replacing-window-web3');
-                return Reflect.set(...args);
-            },
-        });
-        Object.defineProperty(window, 'web3', {
-            value: web3Shim,
-            enumerable: false,
-            configurable: true,
-            writable: true,
-        });
-    }
-}
-exports.default = shimWeb3;
-
-},{}],534:[function(require,module,exports){
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-const messages_1 = __importDefault(require("./messages"));
-const utils_1 = require("./utils");
-/**
- * Sends site metadata over an RPC request.
- *
- * @param engine - The JSON RPC Engine to send metadata over.
- * @param log - The logging API to use.
- */
-async function sendSiteMetadata(engine, log) {
-    try {
-        const domainMetadata = await getSiteMetadata();
-        // call engine.handle directly to avoid normal RPC request handling
-        engine.handle({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'metamask_sendDomainMetadata',
-            params: domainMetadata,
-        }, utils_1.NOOP);
-    }
-    catch (error) {
-        log.error({
-            message: messages_1.default.errors.sendSiteMetadata(),
-            originalError: error,
-        });
-    }
-}
-exports.default = sendSiteMetadata;
-/**
- * Gets site metadata and returns it
- *
- */
-async function getSiteMetadata() {
-    return {
-        name: getSiteName(window),
-        icon: await getSiteIcon(window),
-    };
-}
-/**
- * Extracts a name for the site from the DOM
- */
-function getSiteName(windowObject) {
-    const { document } = windowObject;
-    const siteName = document.querySelector('head > meta[property="og:site_name"]');
-    if (siteName) {
-        return siteName.content;
-    }
-    const metaTitle = document.querySelector('head > meta[name="title"]');
-    if (metaTitle) {
-        return metaTitle.content;
-    }
-    if (document.title && document.title.length > 0) {
-        return document.title;
-    }
-    return window.location.hostname;
-}
-/**
- * Extracts an icon for the site from the DOM
- * @returns an icon URL
- */
-async function getSiteIcon(windowObject) {
-    const { document } = windowObject;
-    const icons = document.querySelectorAll('head > link[rel~="icon"]');
-    for (const icon of icons) {
-        if (icon && await imgExists(icon.href)) {
-            return icon.href;
-        }
-    }
-    return null;
-}
-/**
- * Returns whether the given image URL exists
- * @param url - the url of the image
- * @returns Whether the image exists.
- */
-function imgExists(url) {
-    return new Promise((resolve, reject) => {
-        try {
-            const img = document.createElement('img');
-            img.onload = () => resolve(true);
-            img.onerror = () => resolve(false);
-            img.src = url;
-        }
-        catch (e) {
-            reject(e);
-        }
-    });
-}
-
-},{"./messages":532,"./utils":535}],535:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.EMITTED_NOTIFICATIONS = exports.NOOP = exports.logStreamDisconnectWarning = exports.getRpcPromiseCallback = exports.createErrorMiddleware = void 0;
-const eth_rpc_errors_1 = require("eth-rpc-errors");
-// utility functions
-/**
- * json-rpc-engine middleware that logs RPC errors and and validates req.method.
- *
- * @param log - The logging API to use.
- * @returns  json-rpc-engine middleware function
- */
-function createErrorMiddleware(log) {
-    return (req, res, next) => {
-        // json-rpc-engine will terminate the request when it notices this error
-        if (typeof req.method !== 'string' || !req.method) {
-            res.error = eth_rpc_errors_1.ethErrors.rpc.invalidRequest({
-                message: `The request 'method' must be a non-empty string.`,
-                data: req,
-            });
-        }
-        next((done) => {
-            const { error } = res;
-            if (!error) {
-                return done();
-            }
-            log.error(`MetaMask - RPC Error: ${error.message}`, error);
-            return done();
-        });
-    };
-}
-exports.createErrorMiddleware = createErrorMiddleware;
-// resolve response.result or response, reject errors
-const getRpcPromiseCallback = (resolve, reject, unwrapResult = true) => (error, response) => {
-    if (error || response.error) {
-        reject(error || response.error);
-    }
-    else {
-        !unwrapResult || Array.isArray(response)
-            ? resolve(response)
-            : resolve(response.result);
-    }
-};
-exports.getRpcPromiseCallback = getRpcPromiseCallback;
-/**
- * Logs a stream disconnection error. Emits an 'error' if given an
- * EventEmitter that has listeners for the 'error' event.
- *
- * @param log - The logging API to use.
- * @param remoteLabel - The label of the disconnected stream.
- * @param error - The associated error to log.
- * @param emitter - The logging API to use.
- */
-function logStreamDisconnectWarning(log, remoteLabel, error, emitter) {
-    let warningMsg = `MetaMask: Lost connection to "${remoteLabel}".`;
-    if (error === null || error === void 0 ? void 0 : error.stack) {
-        warningMsg += `\n${error.stack}`;
-    }
-    log.warn(warningMsg);
-    if (emitter && emitter.listenerCount('error') > 0) {
-        emitter.emit('error', warningMsg);
-    }
-}
-exports.logStreamDisconnectWarning = logStreamDisconnectWarning;
-const NOOP = () => undefined;
-exports.NOOP = NOOP;
-// constants
-exports.EMITTED_NOTIFICATIONS = [
-    'eth_subscription',
-];
-
-},{"eth-rpc-errors":423}],536:[function(require,module,exports){
+},{"dup":18}],518:[function(require,module,exports){
 module.exports = isFunction
 
 var toString = Object.prototype.toString
@@ -54536,7 +52746,7 @@ function isFunction (fn) {
       fn === window.prompt))
 };
 
-},{}],537:[function(require,module,exports){
+},{}],519:[function(require,module,exports){
 /**
  * Returns a `Boolean` on whether or not the a `String` starts with '0x'
  * @param {String} str the string input value
@@ -54551,7 +52761,7 @@ module.exports = function isHexPrefixed(str) {
   return str.slice(0, 2) === '0x';
 }
 
-},{}],538:[function(require,module,exports){
+},{}],520:[function(require,module,exports){
 'use strict';
 
 const isStream = stream =>
@@ -54582,14 +52792,14 @@ isStream.transform = stream =>
 
 module.exports = isStream;
 
-},{}],539:[function(require,module,exports){
+},{}],521:[function(require,module,exports){
 var toString = {}.toString;
 
 module.exports = Array.isArray || function (arr) {
   return toString.call(arr) == '[object Array]';
 };
 
-},{}],540:[function(require,module,exports){
+},{}],522:[function(require,module,exports){
 (function (process,global){(function (){
 /**
  * [js-sha3]{@link https://github.com/emn178/js-sha3}
@@ -55068,7 +53278,7 @@ module.exports = Array.isArray || function (arr) {
 })();
 
 }).call(this)}).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"_process":173}],541:[function(require,module,exports){
+},{"_process":173}],523:[function(require,module,exports){
 "use strict";
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
@@ -55319,7 +53529,7 @@ function jsonify(request) {
     return JSON.stringify(request, null, 2);
 }
 
-},{"@metamask/safe-event-emitter":299,"eth-rpc-errors":423}],542:[function(require,module,exports){
+},{"@metamask/safe-event-emitter":311,"eth-rpc-errors":435}],524:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createAsyncMiddleware = void 0;
@@ -55386,7 +53596,7 @@ function createAsyncMiddleware(asyncMiddleware) {
 }
 exports.createAsyncMiddleware = createAsyncMiddleware;
 
-},{}],543:[function(require,module,exports){
+},{}],525:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createScaffoldMiddleware = void 0;
@@ -55408,7 +53618,7 @@ function createScaffoldMiddleware(handlers) {
 }
 exports.createScaffoldMiddleware = createScaffoldMiddleware;
 
-},{}],544:[function(require,module,exports){
+},{}],526:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getUniqueId = void 0;
@@ -55422,7 +53632,7 @@ function getUniqueId() {
 }
 exports.getUniqueId = getUniqueId;
 
-},{}],545:[function(require,module,exports){
+},{}],527:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createIdRemapMiddleware = void 0;
@@ -55442,7 +53652,7 @@ function createIdRemapMiddleware() {
 }
 exports.createIdRemapMiddleware = createIdRemapMiddleware;
 
-},{"./getUniqueId":544}],546:[function(require,module,exports){
+},{"./getUniqueId":526}],528:[function(require,module,exports){
 "use strict";
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -55462,7 +53672,7 @@ __exportStar(require("./getUniqueId"), exports);
 __exportStar(require("./JsonRpcEngine"), exports);
 __exportStar(require("./mergeMiddleware"), exports);
 
-},{"./JsonRpcEngine":541,"./createAsyncMiddleware":542,"./createScaffoldMiddleware":543,"./getUniqueId":544,"./idRemapMiddleware":545,"./mergeMiddleware":547}],547:[function(require,module,exports){
+},{"./JsonRpcEngine":523,"./createAsyncMiddleware":524,"./createScaffoldMiddleware":525,"./getUniqueId":526,"./idRemapMiddleware":527,"./mergeMiddleware":529}],529:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.mergeMiddleware = void 0;
@@ -55474,7 +53684,7 @@ function mergeMiddleware(middlewareStack) {
 }
 exports.mergeMiddleware = mergeMiddleware;
 
-},{"./JsonRpcEngine":541}],548:[function(require,module,exports){
+},{"./JsonRpcEngine":523}],530:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const readable_stream_1 = require("readable-stream");
@@ -55510,7 +53720,7 @@ function createEngineStream(opts) {
 }
 exports.default = createEngineStream;
 
-},{"readable-stream":621}],549:[function(require,module,exports){
+},{"readable-stream":600}],531:[function(require,module,exports){
 "use strict";
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
@@ -55579,7 +53789,7 @@ function createStreamMiddleware() {
 }
 exports.default = createStreamMiddleware;
 
-},{"@metamask/safe-event-emitter":299,"readable-stream":621}],550:[function(require,module,exports){
+},{"@metamask/safe-event-emitter":311,"readable-stream":600}],532:[function(require,module,exports){
 "use strict";
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
@@ -55591,10 +53801,10 @@ exports.createEngineStream = createEngineStream_1.default;
 const createStreamMiddleware_1 = __importDefault(require("./createStreamMiddleware"));
 exports.createStreamMiddleware = createStreamMiddleware_1.default;
 
-},{"./createEngineStream":548,"./createStreamMiddleware":549}],551:[function(require,module,exports){
+},{"./createEngineStream":530,"./createStreamMiddleware":531}],533:[function(require,module,exports){
 module.exports = require('./lib/api')(require('./lib/keccak'))
 
-},{"./lib/api":552,"./lib/keccak":556}],552:[function(require,module,exports){
+},{"./lib/api":534,"./lib/keccak":538}],534:[function(require,module,exports){
 const createKeccak = require('./keccak')
 const createShake = require('./shake')
 
@@ -55623,7 +53833,7 @@ module.exports = function (KeccakState) {
   }
 }
 
-},{"./keccak":553,"./shake":554}],553:[function(require,module,exports){
+},{"./keccak":535,"./shake":536}],535:[function(require,module,exports){
 (function (Buffer){(function (){
 const { Transform } = require('stream')
 
@@ -55704,7 +53914,7 @@ module.exports = (KeccakState) => class Keccak extends Transform {
 }
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"buffer":69,"stream":198}],554:[function(require,module,exports){
+},{"buffer":69,"stream":198}],536:[function(require,module,exports){
 (function (Buffer){(function (){
 const { Transform } = require('stream')
 
@@ -55776,7 +53986,7 @@ module.exports = (KeccakState) => class Shake extends Transform {
 }
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"buffer":69,"stream":198}],555:[function(require,module,exports){
+},{"buffer":69,"stream":198}],537:[function(require,module,exports){
 const P1600_ROUND_CONSTANTS = [1, 0, 32898, 0, 32906, 2147483648, 2147516416, 2147483648, 32907, 0, 2147483649, 0, 2147516545, 2147483648, 32777, 2147483648, 138, 0, 136, 0, 2147516425, 0, 2147483658, 0, 2147516555, 0, 139, 2147483648, 32905, 2147483648, 32771, 2147483648, 32770, 2147483648, 128, 2147483648, 32778, 0, 2147483658, 2147483648, 2147516545, 2147483648, 32896, 2147483648, 2147483649, 0, 2147516424, 2147483648]
 
 exports.p1600 = function (s) {
@@ -55964,7 +54174,7 @@ exports.p1600 = function (s) {
   }
 }
 
-},{}],556:[function(require,module,exports){
+},{}],538:[function(require,module,exports){
 (function (Buffer){(function (){
 const keccakState = require('./keccak-state-unroll')
 
@@ -56036,15 +54246,15 @@ Keccak.prototype.copy = function (dest) {
 module.exports = Keccak
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"./keccak-state-unroll":555,"buffer":69}],557:[function(require,module,exports){
+},{"./keccak-state-unroll":537,"buffer":69}],539:[function(require,module,exports){
 arguments[4][155][0].apply(exports,arguments)
-},{"dup":155,"hash-base":473,"inherits":506,"safe-buffer":624}],558:[function(require,module,exports){
+},{"dup":155,"hash-base":484,"inherits":517,"safe-buffer":603}],540:[function(require,module,exports){
 arguments[4][156][0].apply(exports,arguments)
-},{"bn.js":315,"brorand":316,"dup":156}],559:[function(require,module,exports){
+},{"bn.js":327,"brorand":328,"dup":156}],541:[function(require,module,exports){
 arguments[4][158][0].apply(exports,arguments)
-},{"dup":158}],560:[function(require,module,exports){
+},{"dup":158}],542:[function(require,module,exports){
 arguments[4][159][0].apply(exports,arguments)
-},{"dup":159}],561:[function(require,module,exports){
+},{"dup":159}],543:[function(require,module,exports){
 'use strict'
 
 class Base {
@@ -56072,7 +54282,7 @@ class Base {
 
 module.exports = Base
 
-},{}],562:[function(require,module,exports){
+},{}],544:[function(require,module,exports){
 'use strict'
 const { Buffer } = require('buffer')
 
@@ -56095,7 +54305,7 @@ module.exports = function base16 (alphabet) {
   }
 }
 
-},{"buffer":69}],563:[function(require,module,exports){
+},{"buffer":69}],545:[function(require,module,exports){
 'use strict'
 
 function decode (input, alphabet) {
@@ -56178,7 +54388,7 @@ module.exports = function base32 (alphabet) {
   }
 }
 
-},{}],564:[function(require,module,exports){
+},{}],546:[function(require,module,exports){
 'use strict'
 const { Buffer } = require('buffer')
 
@@ -56224,7 +54434,7 @@ module.exports = function base64 (alphabet) {
   }
 }
 
-},{"buffer":69}],565:[function(require,module,exports){
+},{"buffer":69}],547:[function(require,module,exports){
 'use strict'
 
 const Base = require('./base.js')
@@ -56268,7 +54478,7 @@ module.exports = {
   codes: codes
 }
 
-},{"./base.js":561,"./base16":562,"./base32":563,"./base64":564,"base-x":314}],566:[function(require,module,exports){
+},{"./base.js":543,"./base16":544,"./base32":545,"./base64":546,"base-x":326}],548:[function(require,module,exports){
 /**
  * Implementation of the [multibase](https://github.com/multiformats/multibase) specification.
  * @module Multibase
@@ -56402,7 +54612,7 @@ function getBase (nameOrCode) {
   return base
 }
 
-},{"./constants":565,"buffer":69}],567:[function(require,module,exports){
+},{"./constants":547,"buffer":69}],549:[function(require,module,exports){
 module.exports={
   "identity": 0,
   "ip4": 4,
@@ -56832,9 +55042,9 @@ module.exports={
   "holochain-sig-v0": 10645796,
   "holochain-sig-v1": 10711332
 }
-},{}],568:[function(require,module,exports){
-arguments[4][365][0].apply(exports,arguments)
-},{"./base-table.json":567,"dup":365}],569:[function(require,module,exports){
+},{}],550:[function(require,module,exports){
+arguments[4][377][0].apply(exports,arguments)
+},{"./base-table.json":549,"dup":377}],551:[function(require,module,exports){
 (function (Buffer){(function (){
 /**
  * Implementation of the multicodec specification.
@@ -56964,11 +55174,11 @@ Object.assign(exports, constants)
 exports.print = require('./print')
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"./constants":568,"./int-table":570,"./print":571,"./util":572,"./varint-table":573,"buffer":69,"varint":652}],570:[function(require,module,exports){
-arguments[4][367][0].apply(exports,arguments)
-},{"./base-table.json":567,"dup":367}],571:[function(require,module,exports){
-arguments[4][368][0].apply(exports,arguments)
-},{"./base-table.json":567,"dup":368}],572:[function(require,module,exports){
+},{"./constants":550,"./int-table":552,"./print":553,"./util":554,"./varint-table":555,"buffer":69,"varint":630}],552:[function(require,module,exports){
+arguments[4][379][0].apply(exports,arguments)
+},{"./base-table.json":549,"dup":379}],553:[function(require,module,exports){
+arguments[4][380][0].apply(exports,arguments)
+},{"./base-table.json":549,"dup":380}],554:[function(require,module,exports){
 (function (Buffer){(function (){
 'use strict'
 const varint = require('varint')
@@ -57006,19 +55216,19 @@ function varintEncode (num) {
 }
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"buffer":69,"varint":652}],573:[function(require,module,exports){
-arguments[4][370][0].apply(exports,arguments)
-},{"./base-table.json":567,"./util":572,"dup":370}],574:[function(require,module,exports){
-arguments[4][561][0].apply(exports,arguments)
-},{"dup":561}],575:[function(require,module,exports){
-arguments[4][562][0].apply(exports,arguments)
-},{"buffer":69,"dup":562}],576:[function(require,module,exports){
-arguments[4][563][0].apply(exports,arguments)
-},{"dup":563}],577:[function(require,module,exports){
-arguments[4][564][0].apply(exports,arguments)
-},{"buffer":69,"dup":564}],578:[function(require,module,exports){
-arguments[4][565][0].apply(exports,arguments)
-},{"./base.js":574,"./base16":575,"./base32":576,"./base64":577,"base-x":314,"dup":565}],579:[function(require,module,exports){
+},{"buffer":69,"varint":630}],555:[function(require,module,exports){
+arguments[4][382][0].apply(exports,arguments)
+},{"./base-table.json":549,"./util":554,"dup":382}],556:[function(require,module,exports){
+arguments[4][543][0].apply(exports,arguments)
+},{"dup":543}],557:[function(require,module,exports){
+arguments[4][544][0].apply(exports,arguments)
+},{"buffer":69,"dup":544}],558:[function(require,module,exports){
+arguments[4][545][0].apply(exports,arguments)
+},{"dup":545}],559:[function(require,module,exports){
+arguments[4][546][0].apply(exports,arguments)
+},{"buffer":69,"dup":546}],560:[function(require,module,exports){
+arguments[4][547][0].apply(exports,arguments)
+},{"./base.js":556,"./base16":557,"./base32":558,"./base64":559,"base-x":326,"dup":547}],561:[function(require,module,exports){
 /**
  * Implementation of the [multibase](https://github.com/multiformats/multibase) specification.
  * @module Multibase
@@ -57150,7 +55360,7 @@ function getBase (nameOrCode) {
   return base
 }
 
-},{"./constants":578,"buffer":69}],580:[function(require,module,exports){
+},{"./constants":560,"buffer":69}],562:[function(require,module,exports){
 /* eslint quote-props: off */
 /* eslint key-spacing: off */
 'use strict'
@@ -58186,7 +56396,7 @@ exports.defaultLengths = Object.freeze({
   0xb3e0: 0x80
 })
 
-},{}],581:[function(require,module,exports){
+},{}],563:[function(require,module,exports){
 /**
  * Multihash implementation in JavaScript.
  *
@@ -58412,9 +56622,9 @@ exports.prefix = function prefix (multihash) {
   return multihash.slice(0, 2)
 }
 
-},{"./constants":580,"buffer":69,"multibase":579,"varint":652}],582:[function(require,module,exports){
-arguments[4][464][0].apply(exports,arguments)
-},{"dup":464}],583:[function(require,module,exports){
+},{"./constants":562,"buffer":69,"multibase":561,"varint":630}],564:[function(require,module,exports){
+arguments[4][476][0].apply(exports,arguments)
+},{"dup":476}],565:[function(require,module,exports){
 var BN = require('bn.js');
 var stripHexPrefix = require('strip-hex-prefix');
 
@@ -58454,118 +56664,9 @@ module.exports = function numberToBN(arg) {
   throw new Error('[number-to-bn] while converting number ' + JSON.stringify(arg) + ' to BN.js instance, error: invalid number value. Value must be an integer, hex string, BN or BigNumber instance. Note, decimals are not supported.');
 }
 
-},{"bn.js":582,"strip-hex-prefix":641}],584:[function(require,module,exports){
-const { Duplex } = require('readable-stream')
-const endOfStream = require('end-of-stream')
-const once = require('once')
-const noop = () => {}
-
-const IGNORE_SUBSTREAM = {}
-
-
-class ObjectMultiplex extends Duplex {
-
-  constructor(_opts = {}) {
-    const opts = Object.assign({}, _opts, {
-      objectMode: true,
-    })
-    super(opts)
-
-    this._substreams = {}
-  }
-
-  createStream (name) {
-    // validate name
-    if (!name) throw new Error('ObjectMultiplex - name must not be empty')
-    if (this._substreams[name]) throw new Error('ObjectMultiplex - Substream for name "${name}" already exists')
-
-    // create substream
-    const substream = new Substream({ parent: this, name: name })
-    this._substreams[name] = substream
-
-    // listen for parent stream to end
-    anyStreamEnd(this, (err) => {
-      substream.destroy(err)
-    })
-
-    return substream
-  }
-
-  // ignore streams (dont display orphaned data warning)
-  ignoreStream (name) {
-    // validate name
-    if (!name) throw new Error('ObjectMultiplex - name must not be empty')
-    if (this._substreams[name]) throw new Error('ObjectMultiplex - Substream for name "${name}" already exists')
-    // set
-    this._substreams[name] = IGNORE_SUBSTREAM
-  }
-
-  // stream plumbing
-
-  _read () {}
-
-  _write(chunk, encoding, callback) {
-    // parse message
-    const name = chunk.name
-    const data = chunk.data
-    if (!name) {
-      console.warn(`ObjectMultiplex - malformed chunk without name "${chunk}"`)
-      return callback()
-    }
-
-    // get corresponding substream
-    const substream = this._substreams[name]
-    if (!substream) {
-      console.warn(`ObjectMultiplex - orphaned data for stream "${name}"`)
-      return callback()
-    }
-
-    // push data into substream
-    if (substream !== IGNORE_SUBSTREAM) {
-      substream.push(data)
-    }
-
-    callback()
-  }
-
-}
-
-
-class Substream extends Duplex {
-
-  constructor ({ parent, name }) {
-    super({
-      objectMode: true,
-    })
-
-    this._parent = parent
-    this._name = name
-  }
-
-  _read () {}
-
-  _write (chunk, enc, callback) {
-    this._parent.push({
-      name: this._name,
-      data: chunk,
-    })
-    callback()
-  }
-
-}
-
-module.exports = ObjectMultiplex
-
-// util
-
-function anyStreamEnd(stream, _cb) {
-  const cb = once(_cb)
-  endOfStream(stream, { readable: false }, cb)
-  endOfStream(stream, { writable: false }, cb)
-}
-},{"end-of-stream":414,"once":589,"readable-stream":621}],585:[function(require,module,exports){
+},{"bn.js":564,"strip-hex-prefix":619}],566:[function(require,module,exports){
 arguments[4][160][0].apply(exports,arguments)
-},{"dup":160}],586:[function(require,module,exports){
+},{"dup":160}],567:[function(require,module,exports){
 /*!
  * v2.1.4-104-gc868b3a
  * 
@@ -61474,127 +59575,7 @@ function parseResponseHeaders (headerStr) {
 /***/ })
 /******/ ])["default"];
 });
-},{}],587:[function(require,module,exports){
-'use strict'
-
-const extend = require('xtend')
-const SafeEventEmitter = require('safe-event-emitter')
-
-class ObservableStore extends SafeEventEmitter {
-
-  constructor (initState = {}) {
-    super()
-    // set init state
-    this._state = initState
-  }
-
-  // wrapper around internal getState
-  getState () {
-    return this._getState()
-  }
-  
-  // wrapper around internal putState
-  putState (newState) {
-    this._putState(newState)
-    this.emit('update', newState)
-  }
-
-  updateState (partialState) {
-    // if non-null object, merge
-    if (partialState && typeof partialState === 'object') {
-      const state = this.getState()
-      const newState = Object.assign({}, state, partialState)
-      this.putState(newState)
-    // if not object, use new value
-    } else {
-      this.putState(partialState)
-    }
-  }
-
-  // subscribe to changes
-  subscribe (handler) {
-    this.on('update', handler)
-  }
-
-  // unsubscribe to changes
-  unsubscribe (handler) {
-    this.removeListener('update', handler)
-  }
-
-  //
-  // private
-  //
-
-  // read from persistence
-  _getState () {
-    return this._state
-  }
-
-  // write to persistence
-  _putState (newState) {
-    this._state = newState
-  }
-
-}
-
-module.exports = ObservableStore
-
-},{"safe-event-emitter":625,"xtend":721}],588:[function(require,module,exports){
-const DuplexStream = require('stream').Duplex
-
-module.exports = asStream
-
-
-function asStream(obsStore) {
-  return new ObsStoreStream(obsStore)
-}
-
-//
-//
-//
-//
-
-class ObsStoreStream extends DuplexStream {
-
-  constructor(obsStore) {
-    super({
-      // pass values, not serializations
-      objectMode: true,
-    })
-    // dont buffer outgoing updates
-    this.resume()
-    // save handler so we can unsubscribe later
-    this.handler = (state) => this.push(state)
-    // subscribe to obsStore changes
-    this.obsStore = obsStore
-    this.obsStore.subscribe(this.handler)
-  }
-
-  // emit current state on new destination
-  pipe (dest, options) {
-    const result = DuplexStream.prototype.pipe.call(this, dest, options)
-    dest.write(this.obsStore.getState())
-    return result
-  }
-
-  // write from incomming stream to state
-  _write (chunk, encoding, callback) {
-    this.obsStore.putState(chunk)
-    callback()
-  }
-
-  // noop - outgoing stream is asking us if we have data we arent giving it
-  _read (size) { }
-
-  // unsubscribe from event emitter
-  _destroy (err, callback) {
-    this.obsStore.unsubscribe(this.handler);
-    super._destroy(err, callback)
-  }
-
-}
-
-},{"stream":198}],589:[function(require,module,exports){
+},{}],568:[function(require,module,exports){
 var wrappy = require('wrappy')
 module.exports = wrappy(once)
 module.exports.strict = wrappy(onceStrict)
@@ -61638,17 +59619,17 @@ function onceStrict (fn) {
   return f
 }
 
-},{"wrappy":709}],590:[function(require,module,exports){
+},{"wrappy":687}],569:[function(require,module,exports){
 arguments[4][162][0].apply(exports,arguments)
-},{"dup":162}],591:[function(require,module,exports){
+},{"dup":162}],570:[function(require,module,exports){
 arguments[4][163][0].apply(exports,arguments)
-},{"./certificate":592,"asn1.js":300,"dup":163}],592:[function(require,module,exports){
+},{"./certificate":571,"asn1.js":312,"dup":163}],571:[function(require,module,exports){
 arguments[4][164][0].apply(exports,arguments)
-},{"asn1.js":300,"dup":164}],593:[function(require,module,exports){
+},{"asn1.js":312,"dup":164}],572:[function(require,module,exports){
 arguments[4][165][0].apply(exports,arguments)
-},{"browserify-aes":319,"dup":165,"evp_bytestokey":468,"safe-buffer":624}],594:[function(require,module,exports){
+},{"browserify-aes":331,"dup":165,"evp_bytestokey":479,"safe-buffer":603}],573:[function(require,module,exports){
 arguments[4][166][0].apply(exports,arguments)
-},{"./aesid.json":590,"./asn1":591,"./fixProc":593,"browserify-aes":319,"dup":166,"pbkdf2":596,"safe-buffer":624}],595:[function(require,module,exports){
+},{"./aesid.json":569,"./asn1":570,"./fixProc":572,"browserify-aes":331,"dup":166,"pbkdf2":575,"safe-buffer":603}],574:[function(require,module,exports){
 var trim = function(string) {
   return string.replace(/^\s+|\s+$/g, '');
 }
@@ -61682,19 +59663,19 @@ module.exports = function (headers) {
   return result
 }
 
-},{}],596:[function(require,module,exports){
+},{}],575:[function(require,module,exports){
 arguments[4][167][0].apply(exports,arguments)
-},{"./lib/async":597,"./lib/sync":600,"dup":167}],597:[function(require,module,exports){
+},{"./lib/async":576,"./lib/sync":579,"dup":167}],576:[function(require,module,exports){
 arguments[4][168][0].apply(exports,arguments)
-},{"./default-encoding":598,"./precondition":599,"./sync":600,"./to-buffer":601,"_process":173,"dup":168,"safe-buffer":624}],598:[function(require,module,exports){
+},{"./default-encoding":577,"./precondition":578,"./sync":579,"./to-buffer":580,"_process":173,"dup":168,"safe-buffer":603}],577:[function(require,module,exports){
 arguments[4][169][0].apply(exports,arguments)
-},{"_process":173,"dup":169}],599:[function(require,module,exports){
+},{"_process":173,"dup":169}],578:[function(require,module,exports){
 arguments[4][170][0].apply(exports,arguments)
-},{"dup":170}],600:[function(require,module,exports){
+},{"dup":170}],579:[function(require,module,exports){
 arguments[4][171][0].apply(exports,arguments)
-},{"./default-encoding":598,"./precondition":599,"./to-buffer":601,"create-hash/md5":382,"dup":171,"ripemd160":622,"safe-buffer":624,"sha.js":632}],601:[function(require,module,exports){
+},{"./default-encoding":577,"./precondition":578,"./to-buffer":580,"create-hash/md5":394,"dup":171,"ripemd160":601,"safe-buffer":603,"sha.js":610}],580:[function(require,module,exports){
 arguments[4][172][0].apply(exports,arguments)
-},{"dup":172,"safe-buffer":624}],602:[function(require,module,exports){
+},{"dup":172,"safe-buffer":603}],581:[function(require,module,exports){
 (function (process){(function (){
 'use strict';
 
@@ -61742,19 +59723,19 @@ function nextTick(fn, arg1, arg2, arg3) {
 
 
 }).call(this)}).call(this,require('_process'))
-},{"_process":173}],603:[function(require,module,exports){
+},{"_process":173}],582:[function(require,module,exports){
 arguments[4][174][0].apply(exports,arguments)
-},{"./privateDecrypt":605,"./publicEncrypt":606,"dup":174}],604:[function(require,module,exports){
+},{"./privateDecrypt":584,"./publicEncrypt":585,"dup":174}],583:[function(require,module,exports){
 arguments[4][175][0].apply(exports,arguments)
-},{"create-hash":381,"dup":175,"safe-buffer":624}],605:[function(require,module,exports){
+},{"create-hash":393,"dup":175,"safe-buffer":603}],584:[function(require,module,exports){
 arguments[4][177][0].apply(exports,arguments)
-},{"./mgf":604,"./withPublic":607,"./xor":608,"bn.js":315,"browserify-rsa":337,"create-hash":381,"dup":177,"parse-asn1":594,"safe-buffer":624}],606:[function(require,module,exports){
+},{"./mgf":583,"./withPublic":586,"./xor":587,"bn.js":327,"browserify-rsa":349,"create-hash":393,"dup":177,"parse-asn1":573,"safe-buffer":603}],585:[function(require,module,exports){
 arguments[4][178][0].apply(exports,arguments)
-},{"./mgf":604,"./withPublic":607,"./xor":608,"bn.js":315,"browserify-rsa":337,"create-hash":381,"dup":178,"parse-asn1":594,"randombytes":611,"safe-buffer":624}],607:[function(require,module,exports){
+},{"./mgf":583,"./withPublic":586,"./xor":587,"bn.js":327,"browserify-rsa":349,"create-hash":393,"dup":178,"parse-asn1":573,"randombytes":590,"safe-buffer":603}],586:[function(require,module,exports){
 arguments[4][179][0].apply(exports,arguments)
-},{"bn.js":315,"dup":179,"safe-buffer":624}],608:[function(require,module,exports){
+},{"bn.js":327,"dup":179,"safe-buffer":603}],587:[function(require,module,exports){
 arguments[4][180][0].apply(exports,arguments)
-},{"dup":180}],609:[function(require,module,exports){
+},{"dup":180}],588:[function(require,module,exports){
 (function (process){(function (){
 var once = require('once')
 var eos = require('end-of-stream')
@@ -61840,7 +59821,7 @@ var pump = function () {
 module.exports = pump
 
 }).call(this)}).call(this,require('_process'))
-},{"_process":173,"end-of-stream":414,"fs":25,"once":589}],610:[function(require,module,exports){
+},{"_process":173,"end-of-stream":426,"fs":25,"once":568}],589:[function(require,module,exports){
 'use strict';
 var strictUriEncode = require('strict-uri-encode');
 var objectAssign = require('object-assign');
@@ -62066,11 +60047,11 @@ exports.parseUrl = function (str, opts) {
 	};
 };
 
-},{"decode-uri-component":386,"object-assign":585,"strict-uri-encode":639}],611:[function(require,module,exports){
+},{"decode-uri-component":398,"object-assign":566,"strict-uri-encode":617}],590:[function(require,module,exports){
 arguments[4][185][0].apply(exports,arguments)
-},{"_process":173,"dup":185,"safe-buffer":624}],612:[function(require,module,exports){
+},{"_process":173,"dup":185,"safe-buffer":603}],591:[function(require,module,exports){
 arguments[4][186][0].apply(exports,arguments)
-},{"_process":173,"dup":186,"randombytes":611,"safe-buffer":624}],613:[function(require,module,exports){
+},{"_process":173,"dup":186,"randombytes":590,"safe-buffer":603}],592:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -62202,7 +60183,7 @@ Duplex.prototype._destroy = function (err, cb) {
 
   pna.nextTick(cb, err);
 };
-},{"./_stream_readable":615,"./_stream_writable":617,"core-util-is":379,"inherits":506,"process-nextick-args":602}],614:[function(require,module,exports){
+},{"./_stream_readable":594,"./_stream_writable":596,"core-util-is":391,"inherits":517,"process-nextick-args":581}],593:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -62250,7 +60231,7 @@ function PassThrough(options) {
 PassThrough.prototype._transform = function (chunk, encoding, cb) {
   cb(null, chunk);
 };
-},{"./_stream_transform":616,"core-util-is":379,"inherits":506}],615:[function(require,module,exports){
+},{"./_stream_transform":595,"core-util-is":391,"inherits":517}],594:[function(require,module,exports){
 (function (process,global){(function (){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -63272,7 +61253,7 @@ function indexOf(xs, x) {
   return -1;
 }
 }).call(this)}).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./_stream_duplex":613,"./internal/streams/BufferList":618,"./internal/streams/destroy":619,"./internal/streams/stream":620,"_process":173,"core-util-is":379,"events":110,"inherits":506,"isarray":539,"process-nextick-args":602,"safe-buffer":624,"string_decoder/":640,"util":25}],616:[function(require,module,exports){
+},{"./_stream_duplex":592,"./internal/streams/BufferList":597,"./internal/streams/destroy":598,"./internal/streams/stream":599,"_process":173,"core-util-is":391,"events":110,"inherits":517,"isarray":521,"process-nextick-args":581,"safe-buffer":603,"string_decoder/":618,"util":25}],595:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -63487,7 +61468,7 @@ function done(stream, er, data) {
 
   return stream.push(null);
 }
-},{"./_stream_duplex":613,"core-util-is":379,"inherits":506}],617:[function(require,module,exports){
+},{"./_stream_duplex":592,"core-util-is":391,"inherits":517}],596:[function(require,module,exports){
 (function (process,global,setImmediate){(function (){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -64177,7 +62158,7 @@ Writable.prototype._destroy = function (err, cb) {
   cb(err);
 };
 }).call(this)}).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("timers").setImmediate)
-},{"./_stream_duplex":613,"./internal/streams/destroy":619,"./internal/streams/stream":620,"_process":173,"core-util-is":379,"inherits":506,"process-nextick-args":602,"safe-buffer":624,"timers":233,"util-deprecate":649}],618:[function(require,module,exports){
+},{"./_stream_duplex":592,"./internal/streams/destroy":598,"./internal/streams/stream":599,"_process":173,"core-util-is":391,"inherits":517,"process-nextick-args":581,"safe-buffer":603,"timers":233,"util-deprecate":627}],597:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -64257,7 +62238,7 @@ if (util && util.inspect && util.inspect.custom) {
     return this.constructor.name + ' ' + obj;
   };
 }
-},{"safe-buffer":624,"util":25}],619:[function(require,module,exports){
+},{"safe-buffer":603,"util":25}],598:[function(require,module,exports){
 'use strict';
 
 /*<replacement>*/
@@ -64332,9 +62313,9 @@ module.exports = {
   destroy: destroy,
   undestroy: undestroy
 };
-},{"process-nextick-args":602}],620:[function(require,module,exports){
+},{"process-nextick-args":581}],599:[function(require,module,exports){
 arguments[4][66][0].apply(exports,arguments)
-},{"dup":66,"events":110}],621:[function(require,module,exports){
+},{"dup":66,"events":110}],600:[function(require,module,exports){
 exports = module.exports = require('./lib/_stream_readable.js');
 exports.Stream = exports;
 exports.Readable = exports;
@@ -64343,9 +62324,9 @@ exports.Duplex = require('./lib/_stream_duplex.js');
 exports.Transform = require('./lib/_stream_transform.js');
 exports.PassThrough = require('./lib/_stream_passthrough.js');
 
-},{"./lib/_stream_duplex.js":613,"./lib/_stream_passthrough.js":614,"./lib/_stream_readable.js":615,"./lib/_stream_transform.js":616,"./lib/_stream_writable.js":617}],622:[function(require,module,exports){
+},{"./lib/_stream_duplex.js":592,"./lib/_stream_passthrough.js":593,"./lib/_stream_readable.js":594,"./lib/_stream_transform.js":595,"./lib/_stream_writable.js":596}],601:[function(require,module,exports){
 arguments[4][187][0].apply(exports,arguments)
-},{"buffer":69,"dup":187,"hash-base":473,"inherits":506}],623:[function(require,module,exports){
+},{"buffer":69,"dup":187,"hash-base":484,"inherits":517}],602:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -64597,7 +62578,7 @@ function toBuffer(v) {
 }
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"bn.js":315,"buffer":69}],624:[function(require,module,exports){
+},{"bn.js":327,"buffer":69}],603:[function(require,module,exports){
 /* eslint-disable node/no-deprecated-api */
 var buffer = require('buffer')
 var Buffer = buffer.Buffer
@@ -64661,95 +62642,9 @@ SafeBuffer.allocUnsafeSlow = function (size) {
   return buffer.SlowBuffer(size)
 }
 
-},{"buffer":69}],625:[function(require,module,exports){
-const util = require('util')
-const EventEmitter = require('events/')
-
-var R = typeof Reflect === 'object' ? Reflect : null
-var ReflectApply = R && typeof R.apply === 'function'
-  ? R.apply
-  : function ReflectApply(target, receiver, args) {
-    return Function.prototype.apply.call(target, receiver, args);
-}
-
-module.exports = SafeEventEmitter
-
-
-function SafeEventEmitter() {
-  EventEmitter.call(this)
-}
-
-util.inherits(SafeEventEmitter, EventEmitter)
-
-SafeEventEmitter.prototype.emit = function (type) {
-  // copied from https://github.com/Gozala/events/blob/master/events.js
-  // modified lines are commented with "edited:"
-  var args = [];
-  for (var i = 1; i < arguments.length; i++) args.push(arguments[i]);
-  var doError = (type === 'error');
-
-  var events = this._events;
-  if (events !== undefined)
-    doError = (doError && events.error === undefined);
-  else if (!doError)
-    return false;
-
-  // If there is no 'error' event listener then throw.
-  if (doError) {
-    var er;
-    if (args.length > 0)
-      er = args[0];
-    if (er instanceof Error) {
-      // Note: The comments on the `throw` lines are intentional, they show
-      // up in Node's output if this results in an unhandled exception.
-      throw er; // Unhandled 'error' event
-    }
-    // At least give some kind of context to the user
-    var err = new Error('Unhandled error.' + (er ? ' (' + er.message + ')' : ''));
-    err.context = er;
-    throw err; // Unhandled 'error' event
-  }
-
-  var handler = events[type];
-
-  if (handler === undefined)
-    return false;
-
-  if (typeof handler === 'function') {
-    // edited: using safeApply
-    safeApply(handler, this, args);
-  } else {
-    var len = handler.length;
-    var listeners = arrayClone(handler, len);
-    for (var i = 0; i < len; ++i)
-      // edited: using safeApply
-      safeApply(listeners[i], this, args);
-  }
-
-  return true;
-}
-
-function safeApply(handler, context, args) {
-  try {
-    ReflectApply(handler, context, args)
-  } catch (err) {
-    // throw error after timeout so as not to interupt the stack
-    setTimeout(() => {
-      throw err
-    })
-  }
-}
-
-function arrayClone(arr, n) {
-  var copy = new Array(n);
-  for (var i = 0; i < n; ++i)
-    copy[i] = arr[i];
-  return copy;
-}
-
-},{"events/":467,"util":239}],626:[function(require,module,exports){
+},{"buffer":69}],604:[function(require,module,exports){
 arguments[4][189][0].apply(exports,arguments)
-},{"_process":173,"buffer":69,"dup":189}],627:[function(require,module,exports){
+},{"_process":173,"buffer":69,"dup":189}],605:[function(require,module,exports){
 (function (setImmediate){(function (){
 "use strict";
 
@@ -65241,10 +63136,10 @@ arguments[4][189][0].apply(exports,arguments)
 })(this);
 
 }).call(this)}).call(this,require("timers").setImmediate)
-},{"timers":233}],628:[function(require,module,exports){
+},{"timers":233}],606:[function(require,module,exports){
 module.exports = require('./lib')(require('./lib/elliptic'))
 
-},{"./lib":630,"./lib/elliptic":629}],629:[function(require,module,exports){
+},{"./lib":608,"./lib/elliptic":607}],607:[function(require,module,exports){
 const EC = require('elliptic').ec
 
 const ec = new EC('secp256k1')
@@ -65648,7 +63543,7 @@ module.exports = {
   }
 }
 
-},{"elliptic":398}],630:[function(require,module,exports){
+},{"elliptic":410}],608:[function(require,module,exports){
 const errors = {
   IMPOSSIBLE_CASE: 'Impossible case. Please create issue.',
   TWEAK_ADD:
@@ -65986,23 +63881,23 @@ module.exports = (secp256k1) => {
   }
 }
 
-},{}],631:[function(require,module,exports){
+},{}],609:[function(require,module,exports){
 arguments[4][190][0].apply(exports,arguments)
-},{"dup":190,"safe-buffer":624}],632:[function(require,module,exports){
+},{"dup":190,"safe-buffer":603}],610:[function(require,module,exports){
 arguments[4][191][0].apply(exports,arguments)
-},{"./sha":633,"./sha1":634,"./sha224":635,"./sha256":636,"./sha384":637,"./sha512":638,"dup":191}],633:[function(require,module,exports){
+},{"./sha":611,"./sha1":612,"./sha224":613,"./sha256":614,"./sha384":615,"./sha512":616,"dup":191}],611:[function(require,module,exports){
 arguments[4][192][0].apply(exports,arguments)
-},{"./hash":631,"dup":192,"inherits":506,"safe-buffer":624}],634:[function(require,module,exports){
+},{"./hash":609,"dup":192,"inherits":517,"safe-buffer":603}],612:[function(require,module,exports){
 arguments[4][193][0].apply(exports,arguments)
-},{"./hash":631,"dup":193,"inherits":506,"safe-buffer":624}],635:[function(require,module,exports){
+},{"./hash":609,"dup":193,"inherits":517,"safe-buffer":603}],613:[function(require,module,exports){
 arguments[4][194][0].apply(exports,arguments)
-},{"./hash":631,"./sha256":636,"dup":194,"inherits":506,"safe-buffer":624}],636:[function(require,module,exports){
+},{"./hash":609,"./sha256":614,"dup":194,"inherits":517,"safe-buffer":603}],614:[function(require,module,exports){
 arguments[4][195][0].apply(exports,arguments)
-},{"./hash":631,"dup":195,"inherits":506,"safe-buffer":624}],637:[function(require,module,exports){
+},{"./hash":609,"dup":195,"inherits":517,"safe-buffer":603}],615:[function(require,module,exports){
 arguments[4][196][0].apply(exports,arguments)
-},{"./hash":631,"./sha512":638,"dup":196,"inherits":506,"safe-buffer":624}],638:[function(require,module,exports){
+},{"./hash":609,"./sha512":616,"dup":196,"inherits":517,"safe-buffer":603}],616:[function(require,module,exports){
 arguments[4][197][0].apply(exports,arguments)
-},{"./hash":631,"dup":197,"inherits":506,"safe-buffer":624}],639:[function(require,module,exports){
+},{"./hash":609,"dup":197,"inherits":517,"safe-buffer":603}],617:[function(require,module,exports){
 'use strict';
 module.exports = function (str) {
 	return encodeURIComponent(str).replace(/[!'()*]/g, function (c) {
@@ -66010,9 +63905,9 @@ module.exports = function (str) {
 	});
 };
 
-},{}],640:[function(require,module,exports){
+},{}],618:[function(require,module,exports){
 arguments[4][232][0].apply(exports,arguments)
-},{"dup":232,"safe-buffer":624}],641:[function(require,module,exports){
+},{"dup":232,"safe-buffer":603}],619:[function(require,module,exports){
 var isHexPrefixed = require('is-hex-prefixed');
 
 /**
@@ -66028,7 +63923,7 @@ module.exports = function stripHexPrefix(str) {
   return isHexPrefixed(str) ? str.slice(2) : str;
 }
 
-},{"is-hex-prefixed":537}],642:[function(require,module,exports){
+},{"is-hex-prefixed":519}],620:[function(require,module,exports){
 var unavailable = function unavailable() {
   throw "This swarm.js function isn't available on the browser.";
 };
@@ -66082,7 +63977,7 @@ module.exports = swarm({
   hash: hash,
   pick: pick
 });
-},{"./pick.js":643,"./swarm":645,"./swarm-hash.js":644,"eth-lib/lib/bytes":418,"xhr-request":710}],643:[function(require,module,exports){
+},{"./pick.js":621,"./swarm":623,"./swarm-hash.js":622,"eth-lib/lib/bytes":430,"xhr-request":688}],621:[function(require,module,exports){
 var picker = function picker(type) {
   return function () {
     return new Promise(function (resolve, reject) {
@@ -66148,7 +64043,7 @@ module.exports = {
   file: picker("file"),
   directory: picker("directory")
 };
-},{}],644:[function(require,module,exports){
+},{}],622:[function(require,module,exports){
 // Thanks https://github.com/axic/swarmhash
 var keccak = require("eth-lib/lib/hash").keccak256;
 
@@ -66191,7 +64086,7 @@ var swarmHash = function swarmHash(data) {
 };
 
 module.exports = swarmHash;
-},{"eth-lib/lib/bytes":418,"eth-lib/lib/hash":419}],645:[function(require,module,exports){
+},{"eth-lib/lib/bytes":430,"eth-lib/lib/hash":431}],623:[function(require,module,exports){
 // TODO: this is a temporary fix to hide those libraries from the browser. A
 // slightly better long-term solution would be to split this file into two,
 // separating the functions that are used on Node.js from the functions that
@@ -66865,7 +64760,7 @@ module.exports = function (_ref) {
     toString: toString
   };
 };
-},{}],646:[function(require,module,exports){
+},{}],624:[function(require,module,exports){
 (function (global){(function (){
 //     Underscore.js 1.9.1
 //     http://underscorejs.org
@@ -68561,7 +66456,7 @@ module.exports = function (_ref) {
 }());
 
 }).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],647:[function(require,module,exports){
+},{}],625:[function(require,module,exports){
 module.exports = urlSetQuery
 function urlSetQuery (url, query) {
   if (query) {
@@ -68586,7 +66481,7 @@ function urlSetQuery (url, query) {
   return url
 }
 
-},{}],648:[function(require,module,exports){
+},{}],626:[function(require,module,exports){
 /*! https://mths.be/utf8js v3.0.0 by @mathias */
 ;(function(root) {
 
@@ -68790,9 +66685,9 @@ function urlSetQuery (url, query) {
 
 }(typeof exports === 'undefined' ? this.utf8 = {} : exports));
 
-},{}],649:[function(require,module,exports){
+},{}],627:[function(require,module,exports){
 arguments[4][236][0].apply(exports,arguments)
-},{"dup":236}],650:[function(require,module,exports){
+},{"dup":236}],628:[function(require,module,exports){
 module.exports = read
 
 var MSB = 0x80
@@ -68823,7 +66718,7 @@ function read(buf, offset) {
   return res
 }
 
-},{}],651:[function(require,module,exports){
+},{}],629:[function(require,module,exports){
 module.exports = encode
 
 var MSB = 0x80
@@ -68851,14 +66746,14 @@ function encode(num, out, offset) {
   return out
 }
 
-},{}],652:[function(require,module,exports){
+},{}],630:[function(require,module,exports){
 module.exports = {
     encode: require('./encode.js')
   , decode: require('./decode.js')
   , encodingLength: require('./length.js')
 }
 
-},{"./decode.js":650,"./encode.js":651,"./length.js":653}],653:[function(require,module,exports){
+},{"./decode.js":628,"./encode.js":629,"./length.js":631}],631:[function(require,module,exports){
 
 var N1 = Math.pow(2,  7)
 var N2 = Math.pow(2, 14)
@@ -68885,7 +66780,7 @@ module.exports = function (value) {
   )
 }
 
-},{}],654:[function(require,module,exports){
+},{}],632:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -68956,7 +66851,7 @@ Bzz.prototype.setProvider = function (provider) {
 };
 module.exports = Bzz;
 
-},{"swarm-js":642,"underscore":646}],655:[function(require,module,exports){
+},{"swarm-js":620,"underscore":624}],633:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -69085,7 +66980,7 @@ module.exports = {
     }
 };
 
-},{}],656:[function(require,module,exports){
+},{}],634:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -69515,7 +67410,7 @@ module.exports = {
     outputSyncingFormatter: outputSyncingFormatter
 };
 
-},{"underscore":646,"web3-eth-iban":690,"web3-utils":700}],657:[function(require,module,exports){
+},{"underscore":624,"web3-eth-iban":668,"web3-utils":678}],635:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -69545,7 +67440,7 @@ module.exports = {
     formatters: formatters
 };
 
-},{"./errors":655,"./formatters":656}],658:[function(require,module,exports){
+},{"./errors":633,"./formatters":634}],636:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -70264,7 +68159,7 @@ Method.prototype.request = function () {
 };
 module.exports = Method;
 
-},{"@ethersproject/transactions":295,"underscore":646,"web3-core-helpers":657,"web3-core-promievent":659,"web3-core-subscriptions":664,"web3-utils":700}],659:[function(require,module,exports){
+},{"@ethersproject/transactions":295,"underscore":624,"web3-core-helpers":635,"web3-core-promievent":637,"web3-core-subscriptions":642,"web3-utils":678}],637:[function(require,module,exports){
 /*
  This file is part of web3.js.
 
@@ -70330,7 +68225,7 @@ PromiEvent.resolve = function (value) {
 };
 module.exports = PromiEvent;
 
-},{"eventemitter3":466}],660:[function(require,module,exports){
+},{"eventemitter3":478}],638:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -70399,7 +68294,7 @@ Batch.prototype.execute = function () {
 };
 module.exports = Batch;
 
-},{"./jsonrpc":663,"web3-core-helpers":657}],661:[function(require,module,exports){
+},{"./jsonrpc":641,"web3-core-helpers":635}],639:[function(require,module,exports){
 /*
  This file is part of web3.js.
 
@@ -70477,7 +68372,7 @@ else if (typeof global.web3 !== 'undefined' && global.web3.currentProvider) {
 /* jshint ignore:end */
 module.exports = givenProvider;
 
-},{}],662:[function(require,module,exports){
+},{}],640:[function(require,module,exports){
 /*
     This file is part of web3.js.
     web3.js is free software: you can redistribute it and/or modify
@@ -70793,7 +68688,7 @@ module.exports = {
     BatchManager: BatchManager
 };
 
-},{"./batch.js":660,"./givenProvider.js":661,"./jsonrpc.js":663,"underscore":646,"util":239,"web3-core-helpers":657,"web3-providers-http":695,"web3-providers-ipc":696,"web3-providers-ws":698}],663:[function(require,module,exports){
+},{"./batch.js":638,"./givenProvider.js":639,"./jsonrpc.js":641,"underscore":624,"util":239,"web3-core-helpers":635,"web3-providers-http":673,"web3-providers-ipc":674,"web3-providers-ws":676}],641:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -70874,7 +68769,7 @@ Jsonrpc.toBatchPayload = function (messages) {
 };
 module.exports = Jsonrpc;
 
-},{}],664:[function(require,module,exports){
+},{}],642:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -70937,7 +68832,7 @@ module.exports = {
     subscription: Subscription
 };
 
-},{"./subscription.js":665}],665:[function(require,module,exports){
+},{"./subscription.js":643}],643:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -71214,7 +69109,7 @@ Subscription.prototype.resubscribe = function () {
 };
 module.exports = Subscription;
 
-},{"eventemitter3":466,"underscore":646,"web3-core-helpers":657}],666:[function(require,module,exports){
+},{"eventemitter3":478,"underscore":624,"web3-core-helpers":635}],644:[function(require,module,exports){
 /*
  This file is part of web3.js.
 
@@ -71271,7 +69166,7 @@ var extend = function (pckg) {
 };
 module.exports = extend;
 
-},{"web3-core-helpers":657,"web3-core-method":658,"web3-utils":700}],667:[function(require,module,exports){
+},{"web3-core-helpers":635,"web3-core-method":636,"web3-utils":678}],645:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -71348,7 +69243,7 @@ module.exports = {
     addProviders
 };
 
-},{"./extend":666,"web3-core-requestmanager":662}],668:[function(require,module,exports){
+},{"./extend":644,"web3-core-requestmanager":640}],646:[function(require,module,exports){
 /*
  This file is part of web3.js.
 
@@ -71716,7 +69611,7 @@ ABICoder.prototype.decodeLog = function (inputs, data, topics) {
 var coder = new ABICoder();
 module.exports = coder;
 
-},{"@ethersproject/abi":258,"buffer":69,"underscore":646,"web3-utils":700}],669:[function(require,module,exports){
+},{"@ethersproject/abi":258,"buffer":69,"underscore":624,"web3-utils":678}],647:[function(require,module,exports){
 (function (global,Buffer){(function (){
 /*
  This file is part of web3.js.
@@ -72241,7 +70136,7 @@ function storageAvailable(type) {
 module.exports = Accounts;
 
 }).call(this)}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {},require("buffer").Buffer)
-},{"buffer":69,"crypto":80,"crypto-browserify":385,"eth-lib/lib/account":670,"eth-lib/lib/bytes":672,"eth-lib/lib/hash":673,"eth-lib/lib/rlp":675,"ethereumjs-common":449,"ethereumjs-tx":451,"scrypt-js":627,"underscore":646,"uuid":676,"web3-core":667,"web3-core-helpers":657,"web3-core-method":658,"web3-utils":700}],670:[function(require,module,exports){
+},{"buffer":69,"crypto":80,"crypto-browserify":397,"eth-lib/lib/account":648,"eth-lib/lib/bytes":650,"eth-lib/lib/hash":651,"eth-lib/lib/rlp":653,"ethereumjs-common":461,"ethereumjs-tx":463,"scrypt-js":605,"underscore":624,"uuid":654,"web3-core":645,"web3-core-helpers":635,"web3-core-method":636,"web3-utils":678}],648:[function(require,module,exports){
 (function (Buffer){(function (){
 const Bytes = require("./bytes");
 const Nat = require("./nat");
@@ -72308,7 +70203,7 @@ module.exports = {
   decodeSignature
 };
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"./bytes":672,"./hash":673,"./nat":674,"./rlp":675,"buffer":69,"elliptic":398}],671:[function(require,module,exports){
+},{"./bytes":650,"./hash":651,"./nat":652,"./rlp":653,"buffer":69,"elliptic":410}],649:[function(require,module,exports){
 const generate = (num, fn) => {
   let a = [];
   for (var i = 0; i < num; ++i) a.push(fn(i));
@@ -72338,7 +70233,7 @@ module.exports = {
   flatten,
   chunksOf
 };
-},{}],672:[function(require,module,exports){
+},{}],650:[function(require,module,exports){
 const A = require("./array.js");
 
 const at = (bytes, index) => parseInt(bytes.slice(index * 2 + 2, index * 2 + 4), 16);
@@ -72497,7 +70392,7 @@ module.exports = {
   fromUint8Array,
   toUint8Array
 };
-},{"./array.js":671}],673:[function(require,module,exports){
+},{"./array.js":649}],651:[function(require,module,exports){
 // This was ported from https://github.com/emn178/js-sha3, with some minor
 // modifications and pruning. It is licensed under MIT:
 //
@@ -72829,7 +70724,7 @@ module.exports = {
   keccak256s: keccak(256),
   keccak512s: keccak(512)
 };
-},{}],674:[function(require,module,exports){
+},{}],652:[function(require,module,exports){
 const BN = require("bn.js");
 const Bytes = require("./bytes");
 
@@ -72874,7 +70769,7 @@ module.exports = {
   div,
   sub
 };
-},{"./bytes":672,"bn.js":315}],675:[function(require,module,exports){
+},{"./bytes":650,"bn.js":327}],653:[function(require,module,exports){
 // The RLP format
 // Serialization and deserialization for the BytesTree type, under the following grammar:
 // | First byte | Meaning                                                                    |
@@ -72941,7 +70836,7 @@ const decode = hex => {
 };
 
 module.exports = { encode, decode };
-},{}],676:[function(require,module,exports){
+},{}],654:[function(require,module,exports){
 var v1 = require('./v1');
 var v4 = require('./v4');
 
@@ -72951,7 +70846,7 @@ uuid.v4 = v4;
 
 module.exports = uuid;
 
-},{"./v1":679,"./v4":680}],677:[function(require,module,exports){
+},{"./v1":657,"./v4":658}],655:[function(require,module,exports){
 /**
  * Convert array of 16 byte values to UUID string format of the form:
  * XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
@@ -72977,7 +70872,7 @@ function bytesToUuid(buf, offset) {
 
 module.exports = bytesToUuid;
 
-},{}],678:[function(require,module,exports){
+},{}],656:[function(require,module,exports){
 // Unique ID creation requires a high quality random # generator.  In the
 // browser this is a little complicated due to unknown quality of Math.random()
 // and inconsistent support for the `crypto` API.  We do the best we can via
@@ -73013,7 +70908,7 @@ if (getRandomValues) {
   };
 }
 
-},{}],679:[function(require,module,exports){
+},{}],657:[function(require,module,exports){
 var rng = require('./lib/rng');
 var bytesToUuid = require('./lib/bytesToUuid');
 
@@ -73124,7 +71019,7 @@ function v1(options, buf, offset) {
 
 module.exports = v1;
 
-},{"./lib/bytesToUuid":677,"./lib/rng":678}],680:[function(require,module,exports){
+},{"./lib/bytesToUuid":655,"./lib/rng":656}],658:[function(require,module,exports){
 var rng = require('./lib/rng');
 var bytesToUuid = require('./lib/bytesToUuid');
 
@@ -73155,7 +71050,7 @@ function v4(options, buf, offset) {
 
 module.exports = v4;
 
-},{"./lib/bytesToUuid":677,"./lib/rng":678}],681:[function(require,module,exports){
+},{"./lib/bytesToUuid":655,"./lib/rng":656}],659:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -74003,7 +71898,7 @@ Contract.prototype._executeMethod = function _executeMethod() {
 };
 module.exports = Contract;
 
-},{"underscore":646,"web3-core":667,"web3-core-helpers":657,"web3-core-method":658,"web3-core-promievent":659,"web3-core-subscriptions":664,"web3-eth-abi":668,"web3-utils":700}],682:[function(require,module,exports){
+},{"underscore":624,"web3-core":645,"web3-core-helpers":635,"web3-core-method":636,"web3-core-promievent":637,"web3-core-subscriptions":642,"web3-eth-abi":646,"web3-utils":678}],660:[function(require,module,exports){
 /*
     This file is part of web3.js.
     web3.js is free software: you can redistribute it and/or modify
@@ -74495,7 +72390,7 @@ ENS.prototype.checkNetwork = async function () {
 };
 module.exports = ENS;
 
-},{"./config":683,"./contracts/Registry":684,"./lib/ResolverMethodHandler":686,"./lib/contentHash":687,"underscore":646,"web3-core-helpers":657,"web3-utils":700}],683:[function(require,module,exports){
+},{"./config":661,"./contracts/Registry":662,"./lib/ResolverMethodHandler":664,"./lib/contentHash":665,"underscore":624,"web3-core-helpers":635,"web3-utils":678}],661:[function(require,module,exports){
 /*
     This file is part of web3.js.
     web3.js is free software: you can redistribute it and/or modify
@@ -74543,7 +72438,7 @@ var config = {
 };
 module.exports = config;
 
-},{}],684:[function(require,module,exports){
+},{}],662:[function(require,module,exports){
 /*
     This file is part of web3.js.
     web3.js is free software: you can redistribute it and/or modify
@@ -75024,7 +72919,7 @@ Registry.prototype.setResolver = function (name, address, txConfig, callback) {
 };
 module.exports = Registry;
 
-},{"../resources/ABI/Registry":688,"../resources/ABI/Resolver":689,"eth-ens-namehash":416,"underscore":646,"web3-core-helpers":657,"web3-core-promievent":659,"web3-eth-contract":681,"web3-utils":700}],685:[function(require,module,exports){
+},{"../resources/ABI/Registry":666,"../resources/ABI/Resolver":667,"eth-ens-namehash":428,"underscore":624,"web3-core-helpers":635,"web3-core-promievent":637,"web3-eth-contract":659,"web3-utils":678}],663:[function(require,module,exports){
 /*
     This file is part of web3.js.
     web3.js is free software: you can redistribute it and/or modify
@@ -75048,7 +72943,7 @@ module.exports = Registry;
 var ENS = require('./ENS');
 module.exports = ENS;
 
-},{"./ENS":682}],686:[function(require,module,exports){
+},{"./ENS":660}],664:[function(require,module,exports){
 /*
     This file is part of web3.js.
     web3.js is free software: you can redistribute it and/or modify
@@ -75270,7 +73165,7 @@ ResolverMethodHandler.prototype.checkInterfaceSupport = async function (resolver
 };
 module.exports = ResolverMethodHandler;
 
-},{"../config":683,"eth-ens-namehash":416,"underscore":646,"web3-core-helpers":657,"web3-core-promievent":659}],687:[function(require,module,exports){
+},{"../config":661,"eth-ens-namehash":428,"underscore":624,"web3-core-helpers":635,"web3-core-promievent":637}],665:[function(require,module,exports){
 /*
 Adapted from ensdomains/ui
 https://github.com/ensdomains/ui/blob/3e62e440b53466eeec9dd1c63d73924eefbd88c1/src/utils/contents.js#L1-L85
@@ -75387,7 +73282,7 @@ module.exports = {
     encode: encode
 };
 
-},{"content-hash":376}],688:[function(require,module,exports){
+},{"content-hash":388}],666:[function(require,module,exports){
 "use strict";
 var REGISTRY = [
     {
@@ -75749,7 +73644,7 @@ var REGISTRY = [
 ];
 module.exports = REGISTRY;
 
-},{}],689:[function(require,module,exports){
+},{}],667:[function(require,module,exports){
 "use strict";
 var RESOLVER = [
     {
@@ -76159,7 +74054,7 @@ var RESOLVER = [
 ];
 module.exports = RESOLVER;
 
-},{}],690:[function(require,module,exports){
+},{}],668:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -76395,7 +74290,7 @@ Iban.prototype.toString = function () {
 };
 module.exports = Iban;
 
-},{"bn.js":315,"web3-utils":700}],691:[function(require,module,exports){
+},{"bn.js":327,"web3-utils":678}],669:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -76526,7 +74421,7 @@ var Personal = function Personal() {
 core.addProviders(Personal);
 module.exports = Personal;
 
-},{"web3-core":667,"web3-core-helpers":657,"web3-core-method":658,"web3-net":694,"web3-utils":700}],692:[function(require,module,exports){
+},{"web3-core":645,"web3-core-helpers":635,"web3-core-method":636,"web3-net":672,"web3-utils":678}],670:[function(require,module,exports){
 /*
  This file is part of web3.js.
 
@@ -76599,7 +74494,7 @@ var getNetworkType = function (callback) {
 };
 module.exports = getNetworkType;
 
-},{"underscore":646}],693:[function(require,module,exports){
+},{"underscore":624}],671:[function(require,module,exports){
 /*
  This file is part of web3.js.
 
@@ -77192,7 +75087,7 @@ var Eth = function Eth() {
 core.addProviders(Eth);
 module.exports = Eth;
 
-},{"./getNetworkType.js":692,"underscore":646,"web3-core":667,"web3-core-helpers":657,"web3-core-method":658,"web3-core-subscriptions":664,"web3-eth-abi":668,"web3-eth-accounts":669,"web3-eth-contract":681,"web3-eth-ens":685,"web3-eth-iban":690,"web3-eth-personal":691,"web3-net":694,"web3-utils":700}],694:[function(require,module,exports){
+},{"./getNetworkType.js":670,"underscore":624,"web3-core":645,"web3-core-helpers":635,"web3-core-method":636,"web3-core-subscriptions":642,"web3-eth-abi":646,"web3-eth-accounts":647,"web3-eth-contract":659,"web3-eth-ens":663,"web3-eth-iban":668,"web3-eth-personal":669,"web3-net":672,"web3-utils":678}],672:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -77248,7 +75143,7 @@ var Net = function () {
 core.addProviders(Net);
 module.exports = Net;
 
-},{"web3-core":667,"web3-core-method":658,"web3-utils":700}],695:[function(require,module,exports){
+},{"web3-core":645,"web3-core-method":636,"web3-utils":678}],673:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -77375,7 +75270,7 @@ HttpProvider.prototype.supportsSubscriptions = function () {
 };
 module.exports = HttpProvider;
 
-},{"http":213,"https":148,"web3-core-helpers":657,"xhr2-cookies":716}],696:[function(require,module,exports){
+},{"http":213,"https":148,"web3-core-helpers":635,"xhr2-cookies":694}],674:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -77646,7 +75541,7 @@ IpcProvider.prototype.supportsSubscriptions = function () {
 };
 module.exports = IpcProvider;
 
-},{"oboe":586,"underscore":646,"web3-core-helpers":657}],697:[function(require,module,exports){
+},{"oboe":567,"underscore":624,"web3-core-helpers":635}],675:[function(require,module,exports){
 (function (process,Buffer){(function (){
 var isNode = Object.prototype.toString.call(typeof process !== 'undefined' ? process : 0) === '[object process]';
 var isRN = typeof navigator !== 'undefined' && navigator.product === 'ReactNative';
@@ -77681,7 +75576,7 @@ module.exports = {
 };
 
 }).call(this)}).call(this,require('_process'),require("buffer").Buffer)
-},{"_process":173,"buffer":69,"url":234}],698:[function(require,module,exports){
+},{"_process":173,"buffer":69,"url":234}],676:[function(require,module,exports){
 /*
  This file is part of web3.js.
 
@@ -78038,7 +75933,7 @@ WebsocketProvider.prototype.reconnect = function () {
 };
 module.exports = WebsocketProvider;
 
-},{"./helpers.js":697,"eventemitter3":466,"web3-core-helpers":657,"websocket":706}],699:[function(require,module,exports){
+},{"./helpers.js":675,"eventemitter3":478,"web3-core-helpers":635,"websocket":684}],677:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -78218,7 +76113,7 @@ Shh.prototype.clearSubscriptions = function () {
 core.addProviders(Shh);
 module.exports = Shh;
 
-},{"web3-core":667,"web3-core-method":658,"web3-core-subscriptions":664,"web3-net":694}],700:[function(require,module,exports){
+},{"web3-core":645,"web3-core-method":636,"web3-core-subscriptions":642,"web3-net":672}],678:[function(require,module,exports){
 /*
  This file is part of web3.js.
 
@@ -78623,7 +76518,7 @@ module.exports = {
     compareBlockNumbers: compareBlockNumbers
 };
 
-},{"./soliditySha3.js":701,"./utils.js":702,"bn.js":315,"ethjs-unit":463,"randombytes":611,"underscore":646}],701:[function(require,module,exports){
+},{"./soliditySha3.js":679,"./utils.js":680,"bn.js":327,"ethjs-unit":475,"randombytes":590,"underscore":624}],679:[function(require,module,exports){
 /*
  This file is part of web3.js.
 
@@ -78869,7 +76764,7 @@ module.exports = {
     encodePacked: encodePacked
 };
 
-},{"./utils.js":702,"bn.js":315,"underscore":646}],702:[function(require,module,exports){
+},{"./utils.js":680,"bn.js":327,"underscore":624}],680:[function(require,module,exports){
 (function (Buffer){(function (){
 /*
  This file is part of web3.js.
@@ -79360,9 +77255,9 @@ module.exports = {
 };
 
 }).call(this)}).call(this,{"isBuffer":require("../../../../../.nvm/versions/node/v15.3.0/lib/node_modules/browserify/node_modules/is-buffer/index.js")})
-},{"../../../../../.nvm/versions/node/v15.3.0/lib/node_modules/browserify/node_modules/is-buffer/index.js":152,"bn.js":315,"eth-lib/lib/hash":703,"ethereum-bloom-filters":425,"number-to-bn":583,"underscore":646,"utf8":648}],703:[function(require,module,exports){
-arguments[4][673][0].apply(exports,arguments)
-},{"dup":673}],704:[function(require,module,exports){
+},{"../../../../../.nvm/versions/node/v15.3.0/lib/node_modules/browserify/node_modules/is-buffer/index.js":152,"bn.js":327,"eth-lib/lib/hash":681,"ethereum-bloom-filters":437,"number-to-bn":565,"underscore":624,"utf8":626}],681:[function(require,module,exports){
+arguments[4][651][0].apply(exports,arguments)
+},{"dup":651}],682:[function(require,module,exports){
 /*
     This file is part of web3.js.
 
@@ -79430,7 +77325,7 @@ Web3.modules = {
 core.addProviders(Web3);
 module.exports = Web3;
 
-},{"../package.json":705,"web3-bzz":654,"web3-core":667,"web3-eth":693,"web3-eth-personal":691,"web3-net":694,"web3-shh":699,"web3-utils":700}],705:[function(require,module,exports){
+},{"../package.json":683,"web3-bzz":632,"web3-core":645,"web3-eth":671,"web3-eth-personal":669,"web3-net":672,"web3-shh":677,"web3-utils":678}],683:[function(require,module,exports){
 module.exports={
     "name": "web3",
     "version": "1.3.3",
@@ -79498,7 +77393,7 @@ module.exports={
     "gitHead": "d59d05e81da9fdb54b12b1aa20c95bf05036f00f"
 }
 
-},{}],706:[function(require,module,exports){
+},{}],684:[function(require,module,exports){
 var _globalThis;
 try {
 	_globalThis = require('es5-ext/global');
@@ -79550,10 +77445,10 @@ module.exports = {
     'version'      : websocket_version
 };
 
-},{"./version":707,"es5-ext/global":415}],707:[function(require,module,exports){
+},{"./version":685,"es5-ext/global":427}],685:[function(require,module,exports){
 module.exports = require('../package.json').version;
 
-},{"../package.json":708}],708:[function(require,module,exports){
+},{"../package.json":686}],686:[function(require,module,exports){
 module.exports={
   "name": "websocket",
   "description": "Websocket Client & Server Library implementing the WebSocket protocol as specified in RFC 6455.",
@@ -79613,7 +77508,7 @@ module.exports={
   "license": "Apache-2.0"
 }
 
-},{}],709:[function(require,module,exports){
+},{}],687:[function(require,module,exports){
 // Returns a wrapper function that returns a wrapped callback
 // The wrapper function should do some stuff, and return a
 // presumably different callback function.
@@ -79648,7 +77543,7 @@ function wrappy (fn, cb) {
   }
 }
 
-},{}],710:[function(require,module,exports){
+},{}],688:[function(require,module,exports){
 var queryString = require('query-string')
 var setQuery = require('url-set-query')
 var assign = require('object-assign')
@@ -79709,7 +77604,7 @@ function xhrRequest (url, opt, cb) {
   return request(opt, cb)
 }
 
-},{"./lib/ensure-header.js":711,"./lib/request.js":713,"object-assign":585,"query-string":610,"url-set-query":647}],711:[function(require,module,exports){
+},{"./lib/ensure-header.js":689,"./lib/request.js":691,"object-assign":566,"query-string":589,"url-set-query":625}],689:[function(require,module,exports){
 module.exports = ensureHeader
 function ensureHeader (headers, key, value) {
   var lower = key.toLowerCase()
@@ -79718,7 +77613,7 @@ function ensureHeader (headers, key, value) {
   }
 }
 
-},{}],712:[function(require,module,exports){
+},{}],690:[function(require,module,exports){
 module.exports = getResponse
 function getResponse (opt, resp) {
   if (!resp) return null
@@ -79732,7 +77627,7 @@ function getResponse (opt, resp) {
   }
 }
 
-},{}],713:[function(require,module,exports){
+},{}],691:[function(require,module,exports){
 var xhr = require('xhr')
 var normalize = require('./normalize-response')
 var noop = function () {}
@@ -79776,7 +77671,7 @@ function xhrRequest (opt, cb) {
   return req
 }
 
-},{"./normalize-response":712,"xhr":714}],714:[function(require,module,exports){
+},{"./normalize-response":690,"xhr":692}],692:[function(require,module,exports){
 "use strict";
 var window = require("global/window")
 var isFunction = require("is-function")
@@ -80025,7 +77920,7 @@ function getXml(xhr) {
 
 function noop() {}
 
-},{"global/window":472,"is-function":536,"parse-headers":595,"xtend":721}],715:[function(require,module,exports){
+},{"global/window":483,"is-function":518,"parse-headers":574,"xtend":699}],693:[function(require,module,exports){
 "use strict";
 var __extends = (this && this.__extends) || (function () {
     var extendStatics = Object.setPrototypeOf ||
@@ -80071,7 +77966,7 @@ var SyntaxError = /** @class */ (function (_super) {
 }(Error));
 exports.SyntaxError = SyntaxError;
 
-},{}],716:[function(require,module,exports){
+},{}],694:[function(require,module,exports){
 "use strict";
 function __export(m) {
     for (var p in m) if (!exports.hasOwnProperty(p)) exports[p] = m[p];
@@ -80081,7 +77976,7 @@ __export(require("./xml-http-request"));
 var xml_http_request_event_target_1 = require("./xml-http-request-event-target");
 exports.XMLHttpRequestEventTarget = xml_http_request_event_target_1.XMLHttpRequestEventTarget;
 
-},{"./xml-http-request":720,"./xml-http-request-event-target":718}],717:[function(require,module,exports){
+},{"./xml-http-request":698,"./xml-http-request-event-target":696}],695:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 var ProgressEvent = /** @class */ (function () {
@@ -80097,7 +77992,7 @@ var ProgressEvent = /** @class */ (function () {
 }());
 exports.ProgressEvent = ProgressEvent;
 
-},{}],718:[function(require,module,exports){
+},{}],696:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 var XMLHttpRequestEventTarget = /** @class */ (function () {
@@ -80139,7 +78034,7 @@ var XMLHttpRequestEventTarget = /** @class */ (function () {
 }());
 exports.XMLHttpRequestEventTarget = XMLHttpRequestEventTarget;
 
-},{}],719:[function(require,module,exports){
+},{}],697:[function(require,module,exports){
 (function (Buffer){(function (){
 "use strict";
 var __extends = (this && this.__extends) || (function () {
@@ -80220,7 +78115,7 @@ var XMLHttpRequestUpload = /** @class */ (function (_super) {
 exports.XMLHttpRequestUpload = XMLHttpRequestUpload;
 
 }).call(this)}).call(this,require("buffer").Buffer)
-},{"./xml-http-request-event-target":718,"buffer":69}],720:[function(require,module,exports){
+},{"./xml-http-request-event-target":696,"buffer":69}],698:[function(require,module,exports){
 (function (process,Buffer){(function (){
 "use strict";
 var __extends = (this && this.__extends) || (function () {
@@ -80670,9 +78565,9 @@ XMLHttpRequest.prototype.nodejsHttpsAgent = https.globalAgent;
 XMLHttpRequest.prototype.nodejsBaseUrl = null;
 
 }).call(this)}).call(this,require('_process'),require("buffer").Buffer)
-},{"./errors":715,"./progress-event":717,"./xml-http-request-event-target":718,"./xml-http-request-upload":719,"_process":173,"buffer":69,"cookiejar":378,"http":213,"https":148,"os":161,"url":234}],721:[function(require,module,exports){
+},{"./errors":693,"./progress-event":695,"./xml-http-request-event-target":696,"./xml-http-request-upload":697,"_process":173,"buffer":69,"cookiejar":390,"http":213,"https":148,"os":161,"url":234}],699:[function(require,module,exports){
 arguments[4][241][0].apply(exports,arguments)
-},{"dup":241}],722:[function(require,module,exports){
+},{"dup":241}],700:[function(require,module,exports){
 const createProvider = require('../')
 const Web3 = require('web3')
 
@@ -80704,4 +78599,4 @@ function renderText(text) {
   content.innerText = text
 }
 
-},{"../":243,"web3":704}]},{},[722]);
+},{"../":243,"web3":682}]},{},[700]);
