@@ -32107,7 +32107,7 @@ function getMetaMaskId () {
   }
 }
 
-async function createMetaMaskProvider() {
+function createMetaMaskProvider() {
   const currentMetaMaskId = getMetaMaskId()
   const metamaskPort = chrome.runtime.connect(currentMetaMaskId)
   const pluginStream = new PortStream(metamaskPort)
