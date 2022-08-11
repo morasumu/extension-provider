@@ -15,11 +15,11 @@ function getMetaMaskId () {
   }
 }
 
-function createMetaMaskProvider() {
+function createMetaMaskProvider(option = {}) {
   const currentMetaMaskId = getMetaMaskId()
   const metamaskPort = chrome.runtime.connect(currentMetaMaskId)
   const pluginStream = new PortStream(metamaskPort)
-  return new MetaMaskInpageProvider(pluginStream)
+  return new MetaMaskInpageProvider(pluginStream, options)
 }
 
 module.exports = createMetaMaskProvider
